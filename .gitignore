@@ -13,3 +13,6 @@ wheels/
 *.db
 *.db-wal
 *.db-shm
+
+# Local secrets
+.env
