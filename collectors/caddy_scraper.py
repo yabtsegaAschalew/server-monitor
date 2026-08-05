@@ -1,24 +1,3 @@
-"""Async scraper for Caddy's Prometheus metrics endpoint.
-
-Caddy exposes Prometheus text format at the admin endpoint (``/metrics``) when
-metrics are enabled. This scraper fetches the payload with ``httpx`` and parses
-it with ``prometheus_client``'s text parser to derive the fields that
-``CaddyMetric`` needs:
-
-* ``requests_per_second`` -- delta of the summed ``caddy_http_requests_total``
-  counter across two scrapes, divided by the elapsed wall-clock time (0.0 on
-  the first scrape).
-* ``error_rate`` -- ratio of 4xx/5xx statuses to all requests, computed over
-  the same delta window (instantaneous on the first scrape).
-* ``p99_latency_ms`` -- p99 quantile estimated from the cumulative
-  ``caddy_http_request_duration_seconds`` histogram buckets.
-* ``active_conns`` -- summed ``caddy_http_requests_in_flight`` gauge.
-
-A scrape that cannot fetch or parse the payload raises ``CaddyScrapeError``.
-Callers must not treat a failed scrape as a healthy zero-traffic signal, which
-would otherwise trip the ``requests_per_second`` low-throughput threshold.
-"""
-
 from __future__ import annotations
 
 import time
@@ -38,16 +17,10 @@ CADDY_IN_FLIGHT = "caddy_http_requests_in_flight"
 
 
 class CaddyScrapeError(CollectorError):
-    """Raised when the Caddy metrics endpoint is unreachable or unparseable."""
+    pass
 
 
 def _histogram_quantile(quantile: float, buckets: list[tuple[float, float]]) -> float:
-    """Estimate a quantile from cumulative Prometheus histogram buckets.
-
-    ``buckets`` is a list of ``(upper_bound, cumulative_count)`` pairs sorted
-    ascending. The estimate interpolates linearly inside the bucket that first
-    crosses the quantile's rank, mirroring PromQL's ``histogram_quantile``.
-    """
     if not buckets:
         return 0.0
     total = buckets[-1][1]
@@ -68,8 +41,6 @@ def _histogram_quantile(quantile: float, buckets: list[tuple[float, float]]) -> 
 
 
 class CaddyScraper:
-    """Scrapes Caddy's Prometheus endpoint into a ``CaddyMetric`` payload."""
-
     def __init__(
         self,
         config: CaddyConfig | None = None,
@@ -85,11 +56,8 @@ class CaddyScraper:
         self._previous_errors = 0.0
         self._previous_ts: float | None = None
 
-    # --------------------------------------------------------------- parse
-
     @staticmethod
     def _status_breakdown(family) -> tuple[float, float]:
-        """Return ``(total, error_count)`` from a ``*_total`` counter family."""
         total = 0.0
         errors = 0.0
         for sample in family.samples:
@@ -101,7 +69,6 @@ class CaddyScraper:
 
     @staticmethod
     def _histogram_buckets(family) -> list[tuple[float, float]]:
-        """Collect ``(le, cumulative_count)`` buckets from a histogram family."""
         buckets: list[tuple[float, float]] = []
         for sample in family.samples:
             if not sample.name.endswith("_bucket"):
@@ -120,10 +87,7 @@ class CaddyScraper:
     def _sum_family(family) -> float:
         return sum(sample.value for sample in family.samples)
 
-    # ------------------------------------------------------------- public
-
     async def scrape(self) -> CaddyMetric:
-        """Fetch and parse a fresh Caddy metrics sample."""
         try:
             response = await self._client.get(self._config.metrics_url)
             response.raise_for_status()
@@ -133,9 +97,6 @@ class CaddyScraper:
         try:
             families: dict[str, object] = {}
             for family in text_string_to_metric_families(response.text):
-                # The text parser normalises counter names by stripping the
-                # "_total" suffix; index by both spellings so lookups work
-                # regardless of parser behaviour.
                 families[family.name] = family
                 if family.type == "counter":
                     if family.name.endswith("_total"):
@@ -181,7 +142,6 @@ class CaddyScraper:
         )
 
     async def aclose(self) -> None:
-        """Release the internal HTTP client if this scraper created it."""
         if self._owns_client:
             await self._client.aclose()
 

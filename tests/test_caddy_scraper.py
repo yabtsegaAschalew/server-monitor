@@ -1,11 +1,3 @@
-"""Tests for the standalone Caddy Prometheus scraper.
-
-``CaddyScraper`` fetches Caddy's ``/metrics`` endpoint over HTTP and parses the
-Prometheus text payload into a ``CaddyMetric``. HTTP is mocked with ``respx`` so
-no real sockets are touched; a deterministic ``FakeClock`` drives the
-rate/error-rate delta calculations.
-"""
-
 from __future__ import annotations
 
 import httpx
@@ -20,8 +12,6 @@ CADDY_METRICS_URL = "http://localhost:2019/metrics"
 
 
 class FakeClock:
-    """Deterministic clock so rate/timeout calculations are exact."""
-
     def __init__(self, start: float = 1_000_000.0) -> None:
         self._now = start
 
@@ -33,11 +23,6 @@ class FakeClock:
 
 
 def caddy_text(total: int = 1000, errors: int = 100, in_flight: int = 42) -> str:
-    """Synthesise a Caddy-style Prometheus text payload for tests.
-
-    Buckets are scaled from ``total`` so the p99 estimate is deterministic:
-    with ``total=1000``, bucket counts are 200..1000 and p99 lands at 975ms.
-    """
     two = total - errors
     four = errors // 2
     five = errors - four
@@ -83,9 +68,8 @@ async def test_caddy_scrape_parses_metrics(respx_mock) -> None:
 
     assert isinstance(metric, CaddyMetric)
     assert metric.instance_id == "edge-01"
-    # First scrape: no baseline, so no request rate yet.
     assert metric.requests_per_second == 0.0
-    assert metric.error_rate == pytest.approx(0.10)  # (50+50)/1000
+    assert metric.error_rate == pytest.approx(0.10)
     assert metric.p99_latency_ms == pytest.approx(975.0, abs=1.0)
     assert metric.active_conns == 42
     await scraper.aclose()
@@ -107,8 +91,8 @@ async def test_caddy_rate_and_error_rate_from_delta(respx_mock) -> None:
     clock.advance(2.0)
     metric = await scraper.scrape()
 
-    assert metric.requests_per_second == pytest.approx(500.0)  # 1000 reqs / 2s
-    assert metric.error_rate == pytest.approx(0.10)  # 100 errors / 1000 reqs
+    assert metric.requests_per_second == pytest.approx(500.0)
+    assert metric.error_rate == pytest.approx(0.10)
     await scraper.aclose()
 
 
@@ -141,9 +125,7 @@ async def test_caddy_http_error_status_raises(respx_mock) -> None:
 
 
 async def test_caddy_unparseable_payload_raises(respx_mock) -> None:
-    respx_mock.get(CADDY_METRICS_URL).mock(
-        return_value=httpx.Response(200, text="this is not prometheus \x00 text")
-    )
+    respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(200, text="this is not prometheus \x00 text"))
     scraper = caddy_scraper()
     with pytest.raises(CaddyScrapeError, match="parse"):
         await scraper.scrape()

@@ -36,18 +36,18 @@ line-length = 120
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "UP",   # pyupgrade
-    "B",    # flake8-bugbear
-    "BLE",  # flake8-blind-except: broad catches must be justified
-    "TRY",  # try/except style
-    "PIE",  # misc simplifications
-    "RUF",  # ruff-specific rules
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "BLE",
+    "TRY",
+    "PIE",
+    "RUF",
 ]
-ignore = ["TRY003"]  # long exception messages are fine on our own raise sites
+ignore = ["TRY003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["alerting", "collectors", "config", "database", "main", "models", "state_engine"]
