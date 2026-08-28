@@ -124,9 +124,12 @@ async def test_caddy_http_error_status_raises(respx_mock) -> None:
     await scraper.aclose()
 
 
-async def test_caddy_unparseable_payload_raises(respx_mock) -> None:
+async def test_caddy_unparseable_payload_returns_zeroed_metrics(respx_mock) -> None:
     respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(200, text="this is not prometheus \x00 text"))
     scraper = caddy_scraper()
-    with pytest.raises(CaddyScrapeError, match="parse"):
-        await scraper.scrape()
+    metric = await scraper.scrape()
+    assert metric.requests_per_second == 0.0
+    assert metric.error_rate == 0.0
+    assert metric.p99_latency_ms == 0.0
+    assert metric.active_conns == 0
     await scraper.aclose()

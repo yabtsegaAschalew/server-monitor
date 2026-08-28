@@ -1,0 +1,30 @@
+name: server-monitor
+
+networks:
+  monitor-net:
+    driver: bridge
+
+services:
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    networks: [monitor-net]
+    ports:
+      - "2375:2375"
+    environment:
+      CONTAINERS: "1"
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [monitor-net]
+    environment:
+      DOCKER_BASE_URL: http://docker-socket-proxy:2375
+    command: ["--collectors", "docker"]
+    depends_on:
+      - docker-socket-proxy

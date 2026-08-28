@@ -1,0 +1,51 @@
+polling:
+  interval_seconds: 5.0
+
+thresholds: {}
+
+collectors:
+  host:
+    host_id: localhost
+
+  caddy:
+    instance_id: edge-01
+    metrics_url: http://localhost:2019/metrics
+
+  docker:
+    transport_mode: tcp_proxy
+    base_url: http://localhost:2375
+
+  database:
+    db_path: monitoring.db
+    queue_maxsize: 10000
+    batch_size: 256
+    prune_interval_seconds: 3600
+    retention_days: 7
+
+  network:
+    icmp_interval_seconds: 30
+    snmp_interval_seconds: 60
+    icmp_targets:
+      - host: 8.8.8.8
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+      - host: 1.1.1.1
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+
+    snmp_targets:
+      - device_id: main-router
+        host: 192.168.1.1
+        port: 161
+        timeout_seconds: 5.0
+        username: monitor
+        auth_protocol: sha256
+        auth_password: "${SNMP_AUTH_PASSWORD}"
+        priv_protocol: aes256
+        priv_password: "${SNMP_PRIV_PASSWORD}"
+        poll_interfaces: true
+        poll_host_resources: true
