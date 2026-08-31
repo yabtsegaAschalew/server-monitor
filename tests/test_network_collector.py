@@ -83,24 +83,32 @@ class TestParseIcmpReply:
         header = struct.pack("!BBHHH", 3, 0, 0, 1234, 1)
         assert _parse_icmp_reply(header + b"\x00" * 8) is None
 
-    def test_returns_none_for_wrong_pid(self) -> None:
+    def test_accepts_reply_whose_identifier_is_not_our_pid(self) -> None:
+        """Regression: the identifier field must NOT be matched against the PID.
+
+        On a SOCK_DGRAM/IPPROTO_ICMP socket the kernel rewrites the identifier
+        to the socket's ephemeral port, so a real reply never carries our PID.
+        Rejecting those replies made the engine report 100% loss forever.
+        """
         import os
 
-        wrong_pid = (os.getpid() + 1) & 0xFFFF
-        header = struct.pack("!BBHHH", 0, 0, 0, wrong_pid, 1)
-        assert _parse_icmp_reply(header + b"\x00" * 8) is None
+        kernel_chosen_ident = (os.getpid() + 1) & 0xFFFF
+        header = struct.pack("!BBHHH", 0, 0, 0, kernel_chosen_ident, 1)
+        result = _parse_icmp_reply(header + b"\x00" * 8)
+        assert result is not None
+        ident, seq, _ts = result
+        assert ident == kernel_chosen_ident
+        assert seq == 1
 
     def test_valid_reply(self) -> None:
-        import os
-
         ts = 12345.678
         payload = struct.pack("!d", ts)
-        pid = os.getpid() & 0xFFFF
-        header = struct.pack("!BBHHH", 0, 0, 0, pid, 7)
+        ident = 4242  # an arbitrary kernel-assigned identifier
+        header = struct.pack("!BBHHH", 0, 0, 0, ident, 7)
         result = _parse_icmp_reply(header + payload)
         assert result is not None
-        parsed_pid, seq, parsed_ts = result
-        assert parsed_pid == pid
+        parsed_ident, seq, parsed_ts = result
+        assert parsed_ident == ident
         assert seq == 7
         assert abs(parsed_ts - ts) < 0.001
 
@@ -111,20 +119,37 @@ class TestParseIcmpReply:
 
 
 class TestPingStats:
-    def test_record_and_totals(self) -> None:
+    def test_counters_are_per_cycle(self) -> None:
         stats = _PingStats()
+        stats.begin_cycle()
+        stats.record_sent()
+        stats.record_sent()
+        stats.record_sent()
         stats.record(10.0)
         stats.record(20.0)
-        stats.record_loss()
-        assert stats.total_sent("h", 3) == 3
-        assert stats.total_received("h", 3) == 2
-        assert stats.rtt_values("h") == [10.0, 20.0]
+        assert stats.sent == 3
+        assert stats.received == 2
+        assert stats.window_rtts() == [10.0, 20.0]
+
+    def test_begin_cycle_resets_counters_but_keeps_rtt_window(self) -> None:
+        """Loss must describe the current cycle, not the whole process run."""
+        stats = _PingStats()
+        stats.begin_cycle()
+        stats.record_sent()
+        stats.record(10.0)
+        assert stats.sent == 1
+
+        stats.begin_cycle()
+        assert stats.sent == 0
+        assert stats.received == 0
+        # RTTs are a rolling window across cycles, as the model fields document.
+        assert stats.window_rtts() == [10.0]
 
     def test_empty_stats(self) -> None:
         stats = _PingStats()
-        assert stats.total_sent("h", 5) == 0
-        assert stats.total_received("h", 5) == 0
-        assert stats.rtt_values("h") == []
+        assert stats.sent == 0
+        assert stats.received == 0
+        assert stats.window_rtts() == []
 
 
 # ---------------------------------------------------------------------------
@@ -153,17 +178,54 @@ class TestIcmpPingEngine:
             pass
 
     async def test_build_and_parse_roundtrip(self) -> None:
-        import os
-
         seq = 42
         pkt = _build_icmp_echo(seq)
-        pid = os.getpid() & 0xFFFF
-        # Manually inject a fake reply
         ts_bytes = pkt[8:16]
-        reply_header = struct.pack("!BBHHH", 0, 0, 0, pid, seq)
+        # A real kernel rewrites the identifier on a DGRAM socket, so the reply
+        # comes back with an identifier we never chose. Correlation is by seq.
+        reply_header = struct.pack("!BBHHH", 0, 0, 0, 51234, seq)
         result = _parse_icmp_reply(reply_header + ts_bytes)
         assert result is not None
         assert result[1] == seq
+
+    async def test_on_readable_matches_reply_by_sequence(self) -> None:
+        """The full receive path: an in-flight probe is resolved by seq alone."""
+        engine = IcmpPingEngine(self._make_config())
+        target = IcmpTarget(host="127.0.0.1", count=1, timeout_seconds=1.0)
+
+        clock = iter([100.0, 100.25])
+        engine._now_fn = lambda: next(clock)
+        engine._in_flight[7] = (target, 100.0)
+
+        class _FakeSock:
+            def recvfrom(self, _n: int) -> tuple[bytes, tuple[str, int]]:
+                # Identifier deliberately unrelated to our PID.
+                header = struct.pack("!BBHHH", 0, 0, 0, 9999, 7)
+                return header + struct.pack("!d", 0.0), ("127.0.0.1", 0)
+
+        engine._sock = _FakeSock()
+        engine._stats["127.0.0.1"] = _PingStats()
+        engine._stats["127.0.0.1"].begin_cycle()
+
+        engine._on_readable()
+
+        assert 7 not in engine._in_flight
+        assert engine._stats["127.0.0.1"].received == 1
+
+    def test_open_socket_returns_none_when_no_socket_type_permitted(self, monkeypatch) -> None:
+        """ICMP must disable itself rather than raise.
+
+        Raising here propagated into NetworkCollectorDaemon's TaskGroup and
+        cancelled the SNMP collector as collateral damage.
+        """
+        import socket as socket_mod
+
+        def _denied(*_args, **_kwargs):
+            raise PermissionError("operation not permitted")
+
+        monkeypatch.setattr(socket_mod, "socket", _denied)
+        engine = IcmpPingEngine(self._make_config())
+        assert engine._open_socket() is None
 
 
 # ---------------------------------------------------------------------------

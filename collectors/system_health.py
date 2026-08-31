@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -20,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOST_INTERVAL = 5.0
 DEFAULT_CADDY_INTERVAL = 15.0
-_PROC_ROOT = Path("/proc")
+
+# SECURITY/portability: HOST_ROOT lets the monitor read the real machine's
+# filesystems when they are bind-mounted under a prefix (e.g. /host) in the
+# container. Defaults to / (read the container's own /proc) so behaviour is
+# unchanged outside a container. The disk-usage root follows the same prefix.
+_HOST_ROOT = os.environ.get("HOST_ROOT", "").rstrip("/")
+_PROC_ROOT = Path(f"{_HOST_ROOT}/proc") if _HOST_ROOT else Path("/proc")
 
 
 class _ProcReader(Protocol):
@@ -130,11 +137,11 @@ class HostMetricsCollector:
         self,
         host_id: str = "localhost",
         *,
-        disk_path: str = "/",
+        disk_path: str | None = None,
         reader: _ProcReader | None = None,
     ) -> None:
         self._host_id = host_id
-        self._disk_path = disk_path
+        self._disk_path = disk_path if disk_path is not None else (_HOST_ROOT or "/")
         self._reader = reader or _DEFAULT_READER
         self._snapshot: _CounterSnapshot | None = None
         self._prev_idle, self._prev_total = _read_proc_stat(self._reader)
@@ -273,15 +280,26 @@ class SystemHealthDaemon:
     async def run_forever(self, sink: Callable[[object], object]) -> None:
         self._stop_event = asyncio.Event()
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._host_loop(sink))
-            tg.create_task(self._caddy_loop(sink))
+            self._tasks = [
+                tg.create_task(self._host_loop(sink), name="host-metrics"),
+                tg.create_task(self._caddy_loop(sink), name="caddy-scrape"),
+            ]
 
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        # Both loops spend most of their time inside a sleep of up to
+        # caddy_interval; the flag alone would make shutdown wait that out.
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
 
     async def aclose(self) -> None:
         await self.stop()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+        # Close the HTTP client only once the caddy loop has actually stopped.
         await self._caddy.aclose()
 
     async def __aenter__(self) -> SystemHealthDaemon:

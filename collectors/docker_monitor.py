@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -20,7 +21,21 @@ from .errors import CollectorError
 
 logger = logging.getLogger(__name__)
 
+# read=None is correct for the long-lived event stream, which is idle by design
+# between container events.
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+# ...but it must not leak into one-shot requests, which would then be able to
+# hang forever against a wedged daemon.
+_REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)
+# An unbounded read timeout cannot detect a half-open connection (no RST), so
+# the stream would block in aiter_lines() forever and the reconnect/backoff
+# logic below would never run. Docker emits events sporadically; five minutes of
+# total silence means the connection is dead, not quiet.
+_STREAM_IDLE_TIMEOUT = 300.0
+
+# Docker container IDs are hex. Validating them keeps an attacker-influenced
+# value from steering a request at a different Docker API path.
+_CONTAINER_ID_RE = re.compile(r"\A[0-9a-fA-F]{12,64}\Z")
 
 
 class DockerStreamError(CollectorError):
@@ -103,6 +118,13 @@ def parse_event(payload: dict) -> DockerEvent | None:
     if not container_id:
         return None
 
+    # Reject anything that is not a plain hex container ID before it reaches the
+    # database, where get_container_stats() would later interpolate it into a
+    # request path.
+    if not isinstance(container_id, str) or not _CONTAINER_ID_RE.match(container_id):
+        logger.warning("skipping docker event with malformed container id")
+        return None
+
     if status not in _DOCKER_STATUSES:
         return None
 
@@ -122,7 +144,15 @@ def parse_event(payload: dict) -> DockerEvent | None:
 
 
 class CrashLoopDetector:
-    __slots__ = ("_access_order", "_max_events", "_now", "_window_seconds", "_windows")
+    """Per-container restart windows, with a hard bound on retained containers.
+
+    Eviction used to be gated on ``len(self._windows) % 64 == 0``, which fires on
+    every call while the dict happens to sit at 64 entries and never fires while
+    it hovers at 63. Under container churn the dict grew without any reliable
+    ceiling. Eviction is now time-driven, with a size cap as a backstop.
+    """
+
+    __slots__ = ("_last_evict", "_max_events", "_max_tracked", "_now", "_window_seconds", "_windows")
 
     def __init__(
         self,
@@ -136,7 +166,8 @@ class CrashLoopDetector:
         self._max_events = max_events
         self._now = now
         self._windows: dict[str, deque[float]] = {}
-        self._access_order: deque[str] = deque(maxlen=event_buffer_maxlen)
+        self._max_tracked = max(event_buffer_maxlen, 1)
+        self._last_evict = now()
 
     def _evict_stale(self) -> None:
         now = self._now()
@@ -144,24 +175,31 @@ class CrashLoopDetector:
         stale = [cid for cid, window in self._windows.items() if (not window) or (window[-1] < cutoff)]
         for cid in stale:
             del self._windows[cid]
+        self._last_evict = now
 
-    def _touch(self, container_id: str) -> None:
-        if container_id in self._windows:
-            try:
-                self._access_order.remove(container_id)
-            except ValueError:
-                pass
-        self._access_order.append(container_id)
+        # Backstop: if churn is fast enough that nothing has aged out yet, drop
+        # the least recently active containers. dicts preserve insertion order
+        # and record() re-inserts on each event, so the head is the coldest.
+        overflow = len(self._windows) - self._max_tracked
+        if overflow > 0:
+            for cid in list(self._windows)[:overflow]:
+                del self._windows[cid]
 
     def record(self, container_id: str, ts: float | None = None) -> bool:
-        window = self._windows.setdefault(container_id, deque())
         now = ts if ts is not None else self._now()
+        # Re-insert at the tail so dict order tracks recency for the eviction
+        # backstop above.
+        window = self._windows.pop(container_id, None)
+        if window is None:
+            window = deque()
+        self._windows[container_id] = window
+
         cutoff = now - self._window_seconds
         while window and window[0] <= cutoff:
             window.popleft()
         window.append(now)
-        self._touch(container_id)
-        if len(self._windows) % 64 == 0:
+
+        if (now - self._last_evict) >= self._window_seconds or len(self._windows) > self._max_tracked:
             self._evict_stale()
         return len(window) > self._max_events
 
@@ -242,9 +280,20 @@ class DockerMonitor:
             async with self._client.stream("GET", self._event_url) as response:
                 if response.status_code >= 400:
                     raise DockerStreamError(f"GET {self._event_url} returned status {response.status_code}")
-                async for raw_line in response.aiter_lines():
+                lines = response.aiter_lines()
+                while True:
                     if self._stop_event is not None and self._stop_event.is_set():
                         break
+                    # Bound the wait for the next line. Without this a half-open
+                    # connection parks here forever and never reconnects.
+                    try:
+                        raw_line = await asyncio.wait_for(anext(lines), timeout=_STREAM_IDLE_TIMEOUT)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise DockerStreamError(
+                            f"no docker events for {_STREAM_IDLE_TIMEOUT:.0f}s; treating stream as dead"
+                        ) from exc
                     line = raw_line.strip()
                     if not line:
                         continue
@@ -310,11 +359,20 @@ class DockerMonitor:
 
         Returns parsed JSON stats dict or None on failure.
         """
+        if not _CONTAINER_ID_RE.match(container_id):
+            logger.warning("refusing stats request for malformed container id")
+            return None
         # Derive base from event_url by stripping /events suffix
         base = self._event_url.rsplit("/events", 1)[0]
         url = f"{base}/containers/{container_id}/stats"
         try:
-            response = await self._client.get(url, params={"stream": "false", "one-shot": "true"})
+            response = await self._client.get(
+                url,
+                params={"stream": "false", "one-shot": "true"},
+                # Override the client's read=None, which exists for the event
+                # stream and would let this one-shot call hang indefinitely.
+                timeout=_REQUEST_TIMEOUT,
+            )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError:
@@ -324,14 +382,25 @@ class DockerMonitor:
     async def run_forever(self, sink: Callable[[object], object]) -> None:
         self._stop_event = asyncio.Event()
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._event_loop(sink))
+            self._tasks = [tg.create_task(self._event_loop(sink), name="docker-events")]
 
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        # The loop may be parked in a backoff sleep (up to backoff_max_seconds)
+        # or blocked reading the stream; the flag alone will not free it.
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
 
     async def aclose(self) -> None:
         await self.stop()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+        # Only now is it safe to close the client — doing it while the event
+        # loop task was still live produced "client has been closed" errors on
+        # every shutdown.
         if self._owns_client:
             await self._client.aclose()
 

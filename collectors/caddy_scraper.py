@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,9 +15,22 @@ from models import CaddyMetric
 
 from .errors import CollectorError
 
+logger = logging.getLogger(__name__)
+
 CADDY_REQUESTS_TOTAL = "caddy_http_requests_total"
 CADDY_DURATION_HISTOGRAM = "caddy_http_request_duration_seconds"
 CADDY_IN_FLIGHT = "caddy_http_requests_in_flight"
+
+# The scrape streams at the transport layer but still materialises the filtered
+# lines. A Caddy with high label cardinality can emit tens of thousands of
+# series per family, so cap what we retain rather than trusting the endpoint.
+_MAX_LINES_PER_FAMILY = 50_000
+
+# Explicit end-to-end bound. httpx's default 5s read timeout applies per chunk,
+# so a slow-drip endpoint could hold the stream open indefinitely without ever
+# tripping it.
+_SCRAPE_TIMEOUT = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+_SCRAPE_DEADLINE_SECONDS = 30.0
 
 _KNOWN_FAMILIES: frozenset[str] = frozenset(
     {
@@ -68,7 +83,7 @@ class CaddyScraper:
         now: Callable[[], float] = time.time,
     ) -> None:
         self._config = config or CaddyConfig()
-        self._client = client if client is not None else httpx.AsyncClient()
+        self._client = client if client is not None else httpx.AsyncClient(timeout=_SCRAPE_TIMEOUT)
         self._owns_client = client is None
         self._now = now
         self._previous_total = 0.0
@@ -78,59 +93,57 @@ class CaddyScraper:
     async def _stream_filtered(self) -> dict[str, list[str]]:
         line_bufs: dict[str, list[str]] = {name: [] for name in _KNOWN_FAMILIES}
         current_family: str | None = None
+        truncated: set[str] = set()
         try:
-            async with self._client.stream("GET", self._config.metrics_url) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if stripped.startswith("# HELP "):
-                        rest = stripped[len("# HELP ") :]
-                        candidate = rest.split(None, 1)[0].split("{")[0].strip()
-                        if candidate in _KNOWN_FAMILIES:
-                            current_family = candidate
-                            line_bufs[current_family].append(stripped)
-                        else:
-                            current_family = None
-                    elif stripped.startswith("# TYPE "):
-                        rest = stripped[len("# TYPE ") :]
-                        candidate = rest.split(None, 1)[0].split("{")[0].strip()
-                        if candidate in _KNOWN_FAMILIES:
-                            if current_family is None:
+            async with asyncio.timeout(_SCRAPE_DEADLINE_SECONDS):
+                async with self._client.stream("GET", self._config.metrics_url) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.startswith("# HELP "):
+                            rest = stripped[len("# HELP ") :]
+                            candidate = rest.split(None, 1)[0].split("{")[0].strip()
+                            if candidate in _KNOWN_FAMILIES:
                                 current_family = candidate
-                            line_bufs[current_family].append(stripped)
-                    elif current_family is not None:
-                        line_bufs[current_family].append(stripped)
+                                line_bufs[current_family].append(stripped)
+                            else:
+                                current_family = None
+                        elif stripped.startswith("# TYPE "):
+                            rest = stripped[len("# TYPE ") :]
+                            candidate = rest.split(None, 1)[0].split("{")[0].strip()
+                            if candidate in _KNOWN_FAMILIES:
+                                if current_family is None:
+                                    current_family = candidate
+                                line_bufs[current_family].append(stripped)
+                            else:
+                                # Must reset, exactly as the HELP branch does.
+                                # Leaving current_family pointing at the previous
+                                # (known) family made every sample line of this
+                                # unrelated family get parsed as if it belonged
+                                # to it, silently corrupting request counts,
+                                # error rate and p99.
+                                current_family = None
+                        elif current_family is not None:
+                            buf = line_bufs[current_family]
+                            if len(buf) >= _MAX_LINES_PER_FAMILY:
+                                if current_family not in truncated:
+                                    truncated.add(current_family)
+                                    logger.warning(
+                                        "caddy family %s exceeded %d series; truncating scrape",
+                                        current_family,
+                                        _MAX_LINES_PER_FAMILY,
+                                    )
+                                continue
+                            buf.append(stripped)
+        except TimeoutError as exc:
+            raise CaddyScrapeError(
+                f"GET {self._config.metrics_url} exceeded {_SCRAPE_DEADLINE_SECONDS:.0f}s"
+            ) from exc
         except httpx.HTTPError as exc:
             raise CaddyScrapeError(f"GET {self._config.metrics_url} failed: {exc}") from exc
         return line_bufs
-
-    @staticmethod
-    def _status_breakdown(family) -> tuple[float, float]:
-        total = 0.0
-        errors = 0.0
-        for sample in family.samples:
-            total += sample.value
-            status = sample.labels.get("status") or sample.labels.get("status_code") or ""
-            if status.startswith(("4", "5")):
-                errors += sample.value
-        return total, errors
-
-    @staticmethod
-    def _status_counts(family) -> tuple[float, float, float]:
-        two_xx = 0.0
-        four_xx = 0.0
-        five_xx = 0.0
-        for sample in family.samples:
-            status = sample.labels.get("status") or sample.labels.get("status_code") or ""
-            if status.startswith("2"):
-                two_xx += sample.value
-            elif status.startswith("4"):
-                four_xx += sample.value
-            elif status.startswith("5"):
-                five_xx += sample.value
-        return two_xx, four_xx, five_xx
 
     @staticmethod
     def _histogram_buckets(samples: list[Sample]) -> list[tuple[float, float]]:
@@ -153,19 +166,19 @@ class CaddyScraper:
         return sum(s.value for s in samples)
 
     @staticmethod
-    def _parse_families(text: str) -> dict[str, object]:
-        families: dict[str, object] = {}
-        try:
-            for family in text_string_to_metric_families(text):
-                families[family.name] = family
-                if family.type == "counter":
-                    if family.name.endswith("_total"):
-                        families[family.name[: -len("_total")]] = family
-                    else:
-                        families[family.name + "_total"] = family
-        except Exception as exc:
-            raise CaddyScrapeError(f"failed to parse Prometheus text: {exc}") from exc
-        return families
+    def _samples_from_lines(line_bufs: dict[str, list[str]]) -> dict[str, list[Sample]]:
+        samples_by_family: dict[str, list[Sample]] = {}
+        for name, lines in line_bufs.items():
+            if not lines:
+                continue
+            text = "\n".join(lines) + "\n"
+            try:
+                for family in text_string_to_metric_families(text):
+                    samples_by_family[name] = list(family.samples)
+                    break
+            except Exception as exc:
+                raise CaddyScrapeError(f"failed to parse Prometheus text for {name}: {exc}") from exc
+        return samples_by_family
 
     def _build_metric_from_samples(self, samples_by_family: dict[str, list[Sample]], now: float) -> CaddyMetric:
         req_samples = samples_by_family.get(CADDY_REQUESTS_TOTAL, [])
@@ -212,25 +225,11 @@ class CaddyScraper:
         return total, errors
 
     async def scrape(self) -> CaddyMetric:
-        line_bufs = await self._stream_filtered()
-        samples_by_family: dict[str, list[Sample]] = {}
-        for name, lines in line_bufs.items():
-            if lines:
-                text = "\n".join(lines) + "\n"
-                for family in text_string_to_metric_families(text):
-                    samples_by_family[name] = list(family.samples)
-                    break
+        samples_by_family = self._samples_from_lines(await self._stream_filtered())
         return self._build_metric_from_samples(samples_by_family, self._now())
 
     async def scrape_with_details(self) -> CaddyScrapeResult:
-        line_bufs = await self._stream_filtered()
-        samples_by_family: dict[str, list[Sample]] = {}
-        for name, lines in line_bufs.items():
-            if lines:
-                text = "\n".join(lines) + "\n"
-                for family in text_string_to_metric_families(text):
-                    samples_by_family[name] = list(family.samples)
-                    break
+        samples_by_family = self._samples_from_lines(await self._stream_filtered())
         metric = self._build_metric_from_samples(samples_by_family, self._now())
 
         req_samples = samples_by_family.get(CADDY_REQUESTS_TOTAL, [])

@@ -133,3 +133,35 @@ async def test_caddy_unparseable_payload_returns_zeroed_metrics(respx_mock) -> N
     assert metric.p99_latency_ms == 0.0
     assert metric.active_conns == 0
     await scraper.aclose()
+
+
+async def test_unknown_type_line_does_not_contaminate_known_family(respx_mock) -> None:
+    """Regression: a `# TYPE` for an unknown family must reset the current family.
+
+    The HELP branch reset it; the TYPE branch did not. So when an unknown
+    family's TYPE line arrived while current_family still pointed at a known
+    one, every sample of that unrelated family was appended to the known
+    family's buffer and counted as Caddy traffic.
+    """
+    text = (
+        "# HELP caddy_http_requests_total Counter of HTTP requests processed.\n"
+        "# TYPE caddy_http_requests_total counter\n"
+        'caddy_http_requests_total{handler="file_server",status="2xx"} 100\n'
+        # Unknown family whose TYPE line arrives without a preceding HELP.
+        "# TYPE go_goroutines gauge\n"
+        'go_goroutines{status="5xx"} 999999\n'
+        "# HELP caddy_http_requests_in_flight In flight.\n"
+        "# TYPE caddy_http_requests_in_flight gauge\n"
+        'caddy_http_requests_in_flight{handler="file_server"} 7\n'
+    )
+    respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(200, text=text))
+
+    scraper = caddy_scraper(now=FakeClock())
+    result = await scraper.scrape_with_details()
+
+    # The go_goroutines sample carries status="5xx"; if it leaked into the
+    # requests family it would show up here as 999999 five-hundreds.
+    assert result.five_xx == 0.0
+    assert result.two_xx == 100.0
+    assert result.metric.active_conns == 7
+    await scraper.aclose()

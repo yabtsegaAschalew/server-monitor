@@ -4,18 +4,35 @@ networks:
   monitor-net:
     driver: bridge
 
+volumes:
+  monitor-data:
+
 services:
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:latest
     restart: unless-stopped
     networks: [monitor-net]
-    ports:
-      - "2375:2375"
+    # SECURITY: no `ports:` mapping. The monitor reaches this proxy by service
+    # name over monitor-net; publishing 2375 on the host would hand out an
+    # unauthenticated inventory of every container, image, label and mount to
+    # anything that can reach the host on that port.
     environment:
-      CONTAINERS: "1"
+      # Grants are stated explicitly rather than inherited from image defaults,
+      # so a future image change cannot silently widen the API surface.
+      CONTAINERS: "1"   # GET /containers/... — needed for stats
+      EVENTS: "1"       # GET /events — the monitor's primary stream
+      PING: "1"
+      VERSION: "1"
+      POST: "0"         # blocks every write verb: exec, create, kill, rm
+      EXEC: "0"
       LOG_LEVEL: warning
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt: [no-new-privileges:true]
 
   monitor:
     build:
@@ -23,8 +40,39 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     networks: [monitor-net]
+    # Maps host.docker.internal to the Docker bridge gateway so the caddy
+    # collector can reach a Caddy running on the host without hardcoding a
+    # machine-specific LAN/bridge IP.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # SECURITY: least privilege. This process reads telemetry and writes SQLite;
+    # it needs no capabilities, no privilege escalation, and no writable root fs.
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp
+    # Bounds the memory-growth vectors (SNMP walks, crash-loop windows) at the
+    # container edge, well under the project's <100 MB design target.
+    mem_limit: 128m
     environment:
       DOCKER_BASE_URL: http://docker-socket-proxy:2375
-    command: ["--collectors", "docker"]
+      MONITOR_DB_PATH: /data/monitoring.db
+      UV_CACHE_DIR: /tmp/uv-cache
+      # Point the host collector at the bind-mounted host filesystems.
+      HOST_ROOT: /host
+    volumes:
+      # The only writable path — SQLite plus its -wal and -shm sidecars.
+      - monitor-data:/data
+      # Read-only host filesystems so the host collector reports the real
+      # machine (its /proc, /sys, /etc) rather than the container's own view.
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc:/host/etc:ro
+    # The entrypoint is `python -m main`, whose parser requires a subcommand.
+    # Without the leading "collectors" argparse exits 2 and restart:
+    # unless-stopped turns it into a crash loop.
+    command: ["collectors", "--collectors", "host,caddy,docker,network"]
     depends_on:
       - docker-socket-proxy

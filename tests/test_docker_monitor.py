@@ -68,9 +68,15 @@ def one_shot_stream(*lines: str) -> httpx.Response:
     return stream_response(list(lines))
 
 
+# Docker container IDs are hex (64 chars, 12-char short form). parse_event
+# validates the format before the value can reach the database and, later, a
+# request path — so fixtures must use a realistic ID.
+CONTAINER_ID = "a1b2c3d4e5f6"
+
+
 def docker_event(
     status: str,
-    container_id: str = "c1",
+    container_id: str = CONTAINER_ID,
     name: str = "web-01",
     image: str = "nginx:latest",
     exit_code: int | None = None,
@@ -104,7 +110,7 @@ def test_parse_die_event() -> None:
     event = parse_event(docker_event("die", exit_code=137, signal=9))
 
     assert event is not None
-    assert event.container_id == "c1"
+    assert event.container_id == CONTAINER_ID
     assert event.container_name == "web-01"
     assert event.status == "die"
     assert event.image == "nginx:latest"
@@ -155,6 +161,28 @@ def test_parse_missing_container_id_returns_none() -> None:
     payload = docker_event("die")
     payload["id"] = None
     payload["Actor"]["ID"] = None
+    assert parse_event(payload) is None
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../../v1.41/containers/other",  # path traversal
+        "abc123?stream=true",  # query-string injection
+        "c1",  # too short to be a container ID
+        "z" * 12,  # not hex
+        "a1b2c3d4e5f6/exec",  # extra path segment
+    ],
+)
+def test_parse_event_rejects_malformed_container_id(bad_id: str) -> None:
+    """Malformed IDs must not reach the DB.
+
+    get_container_stats() interpolates the stored ID into a Docker API path, so
+    anything that is not plain hex is a path-manipulation vector.
+    """
+    payload = docker_event("die")
+    payload["id"] = bad_id
+    payload["Actor"]["ID"] = bad_id
     assert parse_event(payload) is None
 
 
@@ -226,7 +254,7 @@ async def test_monitor_streams_events_and_flags_crash_loop(respx_mock) -> None:
     crashes = [i for i in items if isinstance(i, CrashLoopEvent)]
     assert len(events) == 4
     assert len(crashes) == 1
-    assert crashes[0].container_id == "c1"
+    assert crashes[0].container_id == CONTAINER_ID
     assert crashes[0].container_name == "web-01"
     assert crashes[0].event_count == 4
 

@@ -16,6 +16,8 @@ dependencies = [
     "pydantic>=2.7.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
+    "langgraph>=0.2.0",
+    "google-genai>=1.0.0",
 ]
 
 [dependency-groups]
@@ -52,4 +54,15 @@ select = [
 ignore = ["TRY003"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["alerting", "collectors", "config", "database", "main", "models", "state_engine"]
+# Kept in sync with the actual top-level modules. "alerting" and "state_engine"
+# were listed here but have never existed; the alert engine is `alert_engine`.
+known-first-party = [
+    "alert_engine",
+    "collectors",
+    "config",
+    "database",
+    "diagnostic",
+    "main",
+    "models",
+    "providers",
+]
