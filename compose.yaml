@@ -1,0 +1,67 @@
+name: server-monitor
+
+networks:
+  monitor-net:
+    driver: bridge
+
+volumes:
+  monitor-data:
+
+services:
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    networks: [monitor-net]
+    # SECURITY: no `ports:` mapping. The monitor reaches this proxy by service
+    # name over monitor-net; publishing 2375 on the host would hand out an
+    # unauthenticated inventory of every container, image, label and mount to
+    # anything that can reach the host on that port.
+    environment:
+      # Grants are stated explicitly rather than inherited from image defaults,
+      # so a future image change cannot silently widen the API surface.
+      CONTAINERS: "1"   # GET /containers/... — needed for stats
+      EVENTS: "1"       # GET /events — the monitor's primary stream
+      PING: "1"
+      VERSION: "1"
+      POST: "0"         # blocks every write verb: exec, create, kill, rm
+      EXEC: "0"
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt: [no-new-privileges:true]
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [monitor-net]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # SECURITY: least privilege. This process reads telemetry and writes SQLite;
+    # it needs no capabilities, no privilege escalation, and no writable root fs.
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    environment:
+      DOCKER_BASE_URL: http://docker-socket-proxy:2375
+      MONITOR_DB_PATH: /data/monitoring.db
+      UV_CACHE_DIR: /tmp/uv-cache
+      HOST_ROOT: /host
+    volumes:
+      - monitor-data:/data
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc:/host/etc:ro
+      - /:/host/root:ro
+    command: ["collectors", "--collectors", "host,caddy,docker,network"]
+    depends_on:
+      - docker-socket-proxy

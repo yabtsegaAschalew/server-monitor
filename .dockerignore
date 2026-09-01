@@ -1,0 +1,32 @@
+# SECURITY: this file is the only thing standing between `COPY . .` and secrets
+# being baked into an image layer. Keep it in sync with .gitignore.
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+Dockerfile
+compose.yaml
+*.md
+
+# --- Secrets: never copy into an image layer ---------------------------------
+# A populated .env holds GEMINI_API_KEY / SNMP_AUTH_PASSWORD / SNMP_PRIV_PASSWORD.
+# Baked into a layer they survive --env-file, survive deletion in a later layer,
+# and are readable by anyone who can pull the image.
+.env
+.env.*
+!.env.example
+
+# --- Local state: large and never wanted in an image -------------------------
+*.db
+*.db-wal
+*.db-shm
+
+# --- Build artefacts ---------------------------------------------------------
+*.egg-info
+build/
+dist/
+wheels/

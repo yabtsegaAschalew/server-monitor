@@ -1,0 +1,137 @@
+polling:
+  interval_seconds: 5.0
+
+thresholds:
+  host:
+    cpu:
+      warning: 80.0
+      critical: 95.0
+    memory:
+      warning: 85.0
+      critical: 95.0
+    disk:
+      warning: 80.0
+      critical: 90.0
+    load_avg:
+      warning: 4.0
+      critical: 8.0
+  caddy:
+    error_rate:
+      warning: 0.05
+      critical: 0.15
+    p99_latency_ms:
+      warning: 500.0
+      critical: 2000.0
+  network:
+    packet_loss_pct:
+      warning: 5.0
+      critical: 25.0
+    avg_rtt_ms:
+      warning: 150.0
+      critical: 500.0
+
+collectors:
+  host:
+    host_id: localhost
+    # disk_path: /
+
+  caddy:
+    instance_id: edge-01
+    metrics_url: http://host.docker.internal:2020/metrics
+
+  docker:
+    transport_mode: tcp_proxy
+    base_url: http://localhost:2375
+
+  database:
+    db_path: "${MONITOR_DB_PATH:monitoring.db}"
+    queue_maxsize: 1000
+    batch_size: 256
+    prune_interval_seconds: 3600
+    retention_days: 7
+
+  network:
+    icmp_interval_seconds: 30
+    snmp_interval_seconds: 60
+    icmp_targets:
+      - host: 8.8.8.8
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+      - host: 1.1.1.1
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+
+    snmp_targets: []
+    # snmp_targets:
+    #   - device_id: main-router
+    #     host: 192.168.1.1
+    #     port: 161
+    #     timeout_seconds: 5.0
+    #     username: monitor
+    #     auth_protocol: sha256
+    #     auth_password: "${SNMP_AUTH_PASSWORD}"
+    #     priv_protocol: aes256
+    #     priv_password: "${SNMP_PRIV_PASSWORD}"
+    #     poll_interfaces: true
+    #     poll_host_resources: true
+
+alerting:
+  enabled: true
+  evaluation_interval_seconds: 60
+
+  cooldown_minutes: 15
+  resolve_after_seconds: 300
+
+  request_timeout_seconds: 10
+  slo_window_days: 30
+
+  fast_burn_budget_fraction: 0.02
+  fast_burn_long_window_minutes: 60
+  fast_burn_short_window_minutes: 5
+
+  slow_burn_budget_fraction: 0.05
+  slow_burn_long_window_minutes: 360
+  slow_burn_short_window_minutes: 30
+
+  discord_webhook_url: "${DISCORD_WEBHOOK_URL:}"
+  slack_webhook_url: "${SLACK_WEBHOOK_URL:}"
+  smtp:
+    host: "${SMTP_HOST:}"
+    port: 587
+    username: "${SMTP_USERNAME:}"
+    password: "${SMTP_PASSWORD:}"
+    from_addr: "${SMTP_FROM:}"
+    to_addrs: []
+    security: starttls
+
+  slos:
+    - name: caddy-availability
+      source: caddy
+      entity_id: edge-01
+      target: 0.999
+      description: "HTTP success ratio at the edge proxy"
+
+    # - name: dns-reachability
+    #   source: icmp
+    #   entity_id: 8.8.8.8
+    #   target: 0.99
+    #   description: "Upstream DNS reachability"
+
+diagnostic:
+  enabled: true
+  provider: gemini
+  gemini_model: "gemini-1.5-flash"
+  gemini_api_key: "${GEMINI_API_KEY:}"
+  cooldown_minutes: 15
+  max_calls_per_hour: 10
+  evaluation_window_minutes: 10
+  evaluation_interval_seconds: 60
+  enabled_metric_sources:
+    - host
+    - caddy
+    - docker
+    - network
