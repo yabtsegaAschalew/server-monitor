@@ -2,7 +2,9 @@
 
 An asynchronous, low-overhead server monitoring system built with Python 3.12+ and `asyncio`. Collects host metrics, Caddy reverse-proxy telemetry, Docker container events, and network probes (ICMP/SNMP), then persists everything to SQLite via a single-writer queue architecture.
 
-Phase 3 adds a **central diagnostic agent** — a LangGraph orchestrator that detects threshold breaches, invokes a pluggable LLM provider (Gemini by default) for root-cause analysis, and produces human-approved remediation proposals without ever executing commands automatically.
+Includes a **central diagnostic agent** — a LangGraph orchestrator that detects threshold breaches, invokes a pluggable LLM provider (Gemini by default) for root-cause analysis, and produces human-approved remediation proposals without ever executing commands automatically.
+
+Includes **multi-burn-rate SLO alerting** — a fast + slow burn-rate pair with a short canary window, plus Discord / Slack / SMTP notification dispatchers.
 
 ## Architecture
 
@@ -31,7 +33,7 @@ Phase 3 adds a **central diagnostic agent** — a LangGraph orchestrator that de
               └──────────────────────────────────┘
 ```
 
-### Phase 3 — Central Diagnostic Agent
+### Central Diagnostic Agent
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -62,7 +64,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | **WAL mode** | `PRAGMA journal_mode=WAL` enables concurrent reads while the writer holds the lock |
 | **Memory bounded** | Bounded `asyncio.Queue(maxsize=1000)` + batched `executemany` flushes (default batch=256). SLI aggregation for alerting runs as `SUM()` in SQL, so a 6-hour burn window costs the same memory as a 5-minute one |
 | **Queue overflow** | Drop with warning — telemetry is lossy by nature, no backpressure to collector daemons |
-| **Data retention** | Background `_PruneWorker` deletes rows older than 7 days across all5 tables |
+| **Data retention** | Background `_PruneWorker` deletes rows older than 7 days across all tables |
 | **CPU overhead** | No `psutil` — host metrics read directly from `/proc` (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/loadavg`, `/proc/pressure/*`) |
 | **Metric streaming** | Caddy scraper uses `httpx.stream()` with a cardinality filter — only parses the 3 known metric families, discards everything else in-stream |
 | **Provider abstraction** | `AIProvider` adapter interface — swap LLM providers via config (`diagnostic.provider`) with no orchestration changes |
@@ -79,7 +81,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | `config.py` | Pydantic configuration models with YAML loading and env-var interpolation |
 | `models.py` | Pydantic metric models (`HostMetric`, `CaddyMetric`, `DockerEvent`, etc.) |
 | `database.py` | Single-writer persistence engine — `DatabaseEngine` with queue ingest, batched writes, pruning, and query methods |
-| `alert_engine.py` | Phase 4 multi-burn-rate SLO evaluation, alert state machine, and notification dispatchers |
+| `alert_engine.py` | Multi-burn-rate SLO evaluation, alert state machine, and notification dispatchers |
 | `collectors/` | Collector daemon package |
 | `collectors/system_health.py` | Host telemetry from `/proc` + Caddy scrape orchestrator |
 | `collectors/caddy_scraper.py` | Streaming Prometheus scraper with cardinality filtering |
@@ -87,7 +89,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | `providers/` | Pluggable AI provider adapters (vendor-lock-in avoidance) |
 | `providers/base.py` | `AIProvider` abstract interface |
 | `providers/gemini.py` | `GeminiProvider` — Google GenAI SDK implementation |
-| `diagnostic/` | Phase 3 central diagnostic agent (LangGraph) |
+| `diagnostic/` | Central diagnostic agent (LangGraph) |
 | `diagnostic/agent.py` | `DiagnosticAgent` — daemon + CLI wrapper around the compiled graph |
 | `diagnostic/nodes.py` | Three graph nodes: evaluate_metrics, run_diagnostics, human_in_the_loop |
 | `diagnostic/guardrails.py` | Cooldown, rate limiting, and token-usage tracking |
@@ -119,10 +121,10 @@ All database settings live under `collectors.database` in `config.yaml`:
 collectors:
   database:
     db_path: "${MONITOR_DB_PATH:monitoring.db}"  # overridable for containers
-    queue_maxsize: 10000          # Max items in ingest queue (≥100)
-    batch_size: 256               # Items per INSERT transaction (1–10000)
-    prune_interval_seconds: 3600  # How often to run retention pruning
-    retention_days: 7             # Delete data older than N days
+    queue_maxsize: 1000            # Max items in ingest queue (≥100)
+    batch_size: 256                # Items per INSERT transaction (1–10000)
+    prune_interval_seconds: 3600   # How often to run retention pruning
+    retention_days: 7              # Delete data older than N days
 ```
 
 `${VAR}` / `${VAR:default}` placeholders are expanded **after** the YAML is
@@ -171,9 +173,15 @@ Environment variables are interpolated into `config.yaml` messages like `${VAR}`
 
 | Variable | Purpose | Required |
 |----------|---------|----------|
-| `GEMINI_API_KEY` | Google Gemini key for the Phase 3 diagnostic agent | Only if using the diagnostic module |
+| `GEMINI_API_KEY` | Google Gemini key for the diagnostic agent | Only if using the diagnostic module |
 | `SNMP_AUTH_PASSWORD` | SNMPv3 auth password (`auth_password`) | If SNMP auth enabled |
 | `SNMP_PRIV_PASSWORD` | SNMPv3 priv password (`priv_password`) | If SNMP priv enabled |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for alert dispatch | If alerting to Discord |
+| `SLACK_WEBHOOK_URL` | Slack webhook for alert dispatch | If alerting to Slack |
+| `SMTP_HOST` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` | SMTP relay settings for email fallback (all four needed, plus `alerting.smtp.to_addrs` in `config.yaml`) | If alerting by email |
+| `MONITOR_DB_PATH` | SQLite database path (the container image sets this to `/data`); also settable via `collectors.database.db_path` | Only for overriding the default (`monitoring.db`) |
+| `DOCKER_BASE_URL` | Docker API base URL (default `http://docker-socket-proxy:2375`) | Only if overriding the default transport |
+| `DOCKER_SOCKET_PATH` | Direct Unix-socket mode, bypassing the docker-socket-proxy restrictions | Development only
 
 SNMP is opt-in: `snmp_targets` ships empty. A target that declares
 `auth_protocol`/`priv_protocol` with an empty password fails config validation
@@ -186,9 +194,6 @@ Example `config.yaml` for the collectors:
 polling:
   interval_seconds: 5.0
 
-# Field names are DATABASE COLUMN names, because breaches are evaluated against
-# rows read back out of SQLite. An empty mapping means no breach can ever be
-# detected, and the diagnostic agent will never have anything to analyse.
 thresholds:
   host:
     cpu:
@@ -201,26 +206,43 @@ thresholds:
 collectors:
   host:
     host_id: localhost
+    # disk_path: /   # leave unset: "/" on the host, or /host/root when HOST_ROOT is set
 
   caddy:
     instance_id: edge-01
-    metrics_url: http://localhost:2019/metrics
+    metrics_url: http://host.docker.internal:2020/metrics
 
   docker:
-    transport_mode: tcp_proxy
-    base_url: http://localhost:2375
+    transport_mode: tcp_proxy       # tcp_proxy | unix_socket
+    base_url: http://docker-socket-proxy:2375
 
   database:
     db_path: "${MONITOR_DB_PATH:monitoring.db}"
-    queue_maxsize: 10000
+    queue_maxsize: 1000
     batch_size: 256
     prune_interval_seconds: 3600
     retention_days: 7
+
+  network:
+    icmp_interval_seconds: 30
+    snmp_interval_seconds: 60
+    icmp_targets:
+      - host: 8.8.8.8
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+      - host: 1.1.1.1
+        count: 5
+        interval_seconds: 1.0
+        timeout_seconds: 2.0
+        payload_size: 64
+    snmp_targets: []
 ```
 
 #### Diagnostic agent configuration
 
-The Phase 3 diagnostic agent is configured under the top-level `diagnostic` block:
+The diagnostic agent is configured under the top-level `diagnostic` block:
 
 ```yaml
 diagnostic:
@@ -256,17 +278,35 @@ thresholds:
   host:
     cpu:
       warning: 80.0
-      critical: 90.0
-      mode: max
-    memory:
-      warning: 90.0
       critical: 95.0
-      mode: max
+    memory:
+      warning: 85.0
+      critical: 95.0
+    disk:
+      warning: 80.0
+      critical: 90.0
+    load_avg:
+      warning: 4.0
+      critical: 8.0
+  caddy:
+    error_rate:
+      warning: 0.05
+      critical: 0.15
+    p99_latency_ms:
+      warning: 500.0
+      critical: 2000.0
+  network:
+    packet_loss_pct:
+      warning: 5.0
+      critical: 25.0
+    avg_rtt_ms:
+      warning: 150.0
+      critical: 500.0
 ```
 
 ### Run
 
-The CLI is organised into subcommands. The legacy collector entry point is now `collectors`:
+The CLI is organised into subcommands:
 
 ```bash
 # Run the telemetry collectors (host + caddy + docker + network)
@@ -308,20 +348,23 @@ The full workflow: collectors write metrics → the diagnostic daemon detects a 
 
 ### Docker
 
+The shipped `compose.yaml` runs two services on an internal bridge (`monitor-net`):
+
+- **`docker-socket-proxy`** — a read-only proxy for the Docker API. It publishes **no host port**; the monitor reaches it by service name at `http://docker-socket-proxy:2375`. The proxy only grants the GET verbs the monitor needs (`CONTAINERS`, `EVENTS`, `PING`, `VERSION`) and explicitly denies the write verbs (`POST=0`, `EXEC=0`).
+- **`monitor`** — the application itself, hardened (UID 10001, `read_only`, `cap_drop: [ALL]`, 128 MB memory limit). It bind-mounts the host filesystems read-only under `HOST_ROOT=/host` so host metrics report the real machine rather than the container's own view, and maps `host.docker.internal` to the Docker bridge gateway for the Caddy scrape.
+
 ```bash
-docker compose up --build
+docker compose up --build          # build + run both services
+docker compose up -d --build monitor  # rebuild just the monitor
+docker compose logs -f monitor     # follow collector + daemon logs
 ```
 
-Note: Docker monitoring requires the Docker daemon to be reachable over TCP. On Linux, add to `/etc/docker/daemon.json`:
-
-```json
-{"hosts": ["tcp://0.0.0.0:2375"]}
-```
+The Caddy collector reaches a Caddy running *on the host* via `http://host.docker.internal:2020/metrics` (configured in `config.yaml` and covered in `docs/local-caddy-metrics.md`).
 
 ## Running Tests
 
 ```bash
-# Run full test suite (129 tests)
+# Run full test suite (237 passed)
 uv run pytest -v
 
 # Run with coverage
@@ -340,19 +383,19 @@ The system is designed to operate under 100 MB RAM:
 
 | Component | Memory |
 |-----------|--------|
-| Ingest queue (max 10,000 items) | ~4.5 MB worst case |
+| Ingest queue (max 1,000 items) | ~450 KB worst case |
 | Batch buffer (256 items) | ~119 KB |
 | SQLite page cache (WAL) | ~2 MB |
 | Host metrics collector | ~2 KB per snapshot |
 | Diagnostic cooldown cache (≤1000 entries) | ~100 KB |
 | Diagnostic rate-limit window (≤10,000 timestamps) | ~100 KB |
-| **Total overhead** | **~7 MB** |
+| **Total overhead** | **~3 MB** |
 
 The diagnostic agent adds only ~200 KB of state on top of the collectors — single-shot LLM calls mean there is no growing conversation/history buffer on the hot path.
 
 ### How Memory is Bounded
 
-- **Queue**: `asyncio.Queue(maxsize=10000)` — bounded, drops on overflow
+- **Queue**: `asyncio.Queue(maxsize=1000)` — bounded, drops on overflow
 - **Batch flush**: Drains up to `batch_size` items per `get_nowait()` loop — no accumulation
 - **`__slots__`**: `_CounterSnapshot` uses `@dataclass(slots=True)`; `DiagnosticAgent` and `Guardrails` declare explicit `__slots__` to avoid per-instance `__dict__`
 - **No `psutil`**: Direct `/proc` reads avoid C-extension namedtuple allocations
@@ -380,6 +423,8 @@ server-monitor/
 ├── database.py              # Single-writer SQLite persistence engine
 ├── models.py                # Pydantic metric models
 ├── .env.example             # Environment variable template (copy to .env)
+├── docs/
+│   └── local-caddy-metrics.md  # Local Caddy setup for the monitored edge proxy
 ├── pyproject.toml           # Project metadata + dependencies
 ├── compose.yaml             # Docker Compose for containerised deployment
 ├── Dockerfile               # Container build
@@ -395,7 +440,7 @@ server-monitor/
 │   ├── base.py              # AIProvider abstract interface (adapter)
 │   ├── gemini.py            # GeminiProvider (Google GenAI SDK)
 │   └── models.py            # ActionPlan, Severity, TokenUsage (Pydantic)
-├── alert_engine.py          # Phase 4 burn-rate evaluation + dispatchers
+├── alert_engine.py          # Burn-rate evaluation + dispatchers
 ├── diagnostic/
 │   ├── __init__.py          # Lazy package exports
 │   ├── __main__.py          # `python -m diagnostic` entry point
@@ -423,7 +468,7 @@ server-monitor/
     └── test_execution_boundary.py   # asserts the no-execution guarantee
 ```
 
-## Phase 4 — Multi-Burn-Rate Alerting
+## Multi-Burn-Rate Alerting
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -465,9 +510,26 @@ not an outage.
 ```yaml
 alerting:
   enabled: true
+  evaluation_interval_seconds: 60
   cooldown_minutes: 15        # suppression: gap between notifications
   resolve_after_seconds: 300  # flapping: quiet period before resolving
+  slo_window_days: 30
+  fast_burn_budget_fraction: 0.02
+  fast_burn_long_window_minutes: 60
+  fast_burn_short_window_minutes: 5
+  slow_burn_budget_fraction: 0.05
+  slow_burn_long_window_minutes: 360
+  slow_burn_short_window_minutes: 30
   discord_webhook_url: "${DISCORD_WEBHOOK_URL:}"
+  slack_webhook_url: "${SLACK_WEBHOOK_URL:}"
+  smtp:
+    host: "${SMTP_HOST:}"
+    port: 587
+    username: "${SMTP_USERNAME:}"
+    password: "${SMTP_PASSWORD:}"
+    from_addr: "${SMTP_FROM:}"
+    to_addrs: []
+    security: starttls
   slos:
     - name: caddy-availability
       source: caddy           # caddy | icmp
