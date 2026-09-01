@@ -55,6 +55,7 @@ def caddy_text(total: int = 1000, errors: int = 100, in_flight: int = 42) -> str
 
 
 def caddy_scraper(**kwargs) -> CaddyScraper:
+
     return CaddyScraper(
         CaddyConfig(instance_id="edge-01", metrics_url=CADDY_METRICS_URL),
         **kwargs,
@@ -67,10 +68,12 @@ async def test_caddy_scrape_parses_metrics(respx_mock) -> None:
     metric = await scraper.scrape()
 
     assert isinstance(metric, CaddyMetric)
+
     assert metric.instance_id == "edge-01"
     assert metric.requests_per_second == 0.0
     assert metric.error_rate == pytest.approx(0.10)
     assert metric.p99_latency_ms == pytest.approx(975.0, abs=1.0)
+
     assert metric.active_conns == 42
     await scraper.aclose()
 
@@ -97,11 +100,13 @@ async def test_caddy_rate_and_error_rate_from_delta(respx_mock) -> None:
 
 
 async def test_caddy_missing_families_default_to_zero(respx_mock) -> None:
+
     respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(200, text="# no metrics yet\n"))
     scraper = caddy_scraper()
     metric = await scraper.scrape()
 
     assert metric.requests_per_second == 0.0
+
     assert metric.error_rate == 0.0
     assert metric.p99_latency_ms == 0.0
     assert metric.active_conns == 0
@@ -118,6 +123,7 @@ async def test_caddy_unreachable_raises(respx_mock) -> None:
 
 async def test_caddy_http_error_status_raises(respx_mock) -> None:
     respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(500, text="internal error"))
+
     scraper = caddy_scraper()
     with pytest.raises(CaddyScrapeError, match="GET"):
         await scraper.scrape()
@@ -147,7 +153,6 @@ async def test_unknown_type_line_does_not_contaminate_known_family(respx_mock) -
         "# HELP caddy_http_requests_total Counter of HTTP requests processed.\n"
         "# TYPE caddy_http_requests_total counter\n"
         'caddy_http_requests_total{handler="file_server",status="2xx"} 100\n'
-        # Unknown family whose TYPE line arrives without a preceding HELP.
         "# TYPE go_goroutines gauge\n"
         'go_goroutines{status="5xx"} 999999\n'
         "# HELP caddy_http_requests_in_flight In flight.\n"
@@ -159,8 +164,6 @@ async def test_unknown_type_line_does_not_contaminate_known_family(respx_mock) -
     scraper = caddy_scraper(now=FakeClock())
     result = await scraper.scrape_with_details()
 
-    # The go_goroutines sample carries status="5xx"; if it leaked into the
-    # requests family it would show up here as 999999 five-hundreds.
     assert result.five_xx == 0.0
     assert result.two_xx == 100.0
     assert result.metric.active_conns == 7

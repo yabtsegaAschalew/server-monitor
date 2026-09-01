@@ -56,6 +56,7 @@ def _slo(name: str = "caddy-availability", source: SloSource = SloSource.CADDY, 
 
 
 def _alerting_config(**kw) -> AlertingConfig:
+
     kw.setdefault("slos", [_slo()])
     return AlertingConfig(**kw)
 
@@ -85,11 +86,6 @@ async def _seed_icmp(db_path: str, rows: list[tuple[int, int, datetime]]) -> Non
         await conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Burn-rate arithmetic
-# ---------------------------------------------------------------------------
-
-
 class TestBurnRateMath:
     def test_canonical_fast_threshold(self) -> None:
         """2% of a 30-day budget in one hour is the well-known 14.4x."""
@@ -107,7 +103,6 @@ class TestBurnRateMath:
             burn_rate_threshold(0.02, 0.0)
 
     def test_burn_rate_is_ratio_over_budget(self) -> None:
-        # 1% failures against a 0.1% budget is a 10x burn.
         assert burn_rate(0.01, 0.001) == pytest.approx(10.0)
 
     def test_burn_rate_rejects_zero_budget(self) -> None:
@@ -117,21 +112,18 @@ class TestBurnRateMath:
     def test_budget_consumed_is_the_inverse_of_threshold(self) -> None:
         """Round-trip: 14.4x for an hour must report back as 2% of budget."""
         assert budget_consumed_pct(14.4, 1.0, 30) == pytest.approx(2.0)
+
         assert budget_consumed_pct(6.0, 6.0, 30) == pytest.approx(5.0)
 
     def test_build_burn_windows_uses_config(self) -> None:
         fast, slow = build_burn_windows(_alerting_config())
+
         assert fast.burn_class == "fast"
         assert fast.threshold == pytest.approx(14.4)
         assert fast.severity is Severity.CRITICAL
         assert slow.burn_class == "slow"
         assert slow.threshold == pytest.approx(6.0)
         assert slow.severity is Severity.HIGH
-
-
-# ---------------------------------------------------------------------------
-# SLI computation
-# ---------------------------------------------------------------------------
 
 
 class TestSloEvaluator:
@@ -149,8 +141,8 @@ class TestSloEvaluator:
             await _seed_caddy(
                 config.db_path,
                 [
-                    (1000.0, 0.0, now - timedelta(minutes=2)),  # busy, all good
-                    (100.0, 1.0, now - timedelta(minutes=1)),  # quiet, all bad
+                    (1000.0, 0.0, now - timedelta(minutes=2)),
+                    (100.0, 1.0, now - timedelta(minutes=1)),
                 ],
             )
             sample = await SloEvaluator(db).failure_ratio(_slo(), minutes=60)
@@ -184,7 +176,6 @@ class TestSloEvaluator:
             )
             slo = _slo(name="dns", source=SloSource.ICMP, entity_id="8.8.8.8", target=0.99)
             sample = await SloEvaluator(db).failure_ratio(slo, minutes=60)
-            # 10 sent, 6 received -> 40% loss
             assert sample.failure_ratio == pytest.approx(0.4)
             assert sample.volume == pytest.approx(10.0)
         finally:
@@ -199,7 +190,7 @@ class TestSloEvaluator:
             await _seed_caddy(
                 config.db_path,
                 [
-                    (100.0, 1.0, now - timedelta(hours=5)),  # outside a 60m window
+                    (100.0, 1.0, now - timedelta(hours=5)),
                     (100.0, 0.0, now - timedelta(minutes=1)),
                 ],
             )
@@ -209,11 +200,6 @@ class TestSloEvaluator:
             await db.aclose()
 
 
-# ---------------------------------------------------------------------------
-# Multi-window firing behaviour
-# ---------------------------------------------------------------------------
-
-
 class TestMultiWindow:
     async def test_fires_when_both_windows_breach(self, tmp_path: Path) -> None:
         config = _db_config(tmp_path)
@@ -221,7 +207,6 @@ class TestMultiWindow:
         await db.start()
         try:
             now = datetime.now(UTC)
-            # 5% failures against a 0.1% budget is a 50x burn: over both.
             await _seed_caddy(
                 config.db_path,
                 [(100.0, 0.05, now - timedelta(minutes=m)) for m in range(1, 50)],
@@ -258,12 +243,12 @@ class TestMultiWindow:
             await db.aclose()
 
     async def test_does_not_fire_below_threshold(self, tmp_path: Path) -> None:
+
         config = _db_config(tmp_path)
         db = DatabaseEngine(config)
         await db.start()
         try:
             now = datetime.now(UTC)
-            # 0.1% failures == exactly the budget == 1x burn, far below 14.4x.
             await _seed_caddy(
                 config.db_path,
                 [(100.0, 0.001, now - timedelta(minutes=m)) for m in range(1, 50)],
@@ -273,11 +258,6 @@ class TestMultiWindow:
             assert await engine.evaluate_slo(_slo(), fast) is None
         finally:
             await db.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Suppression and flapping protection
-# ---------------------------------------------------------------------------
 
 
 class _RecordingDispatcher:
@@ -339,7 +319,6 @@ class TestSuppressionAndFlapping:
             await engine.evaluate_once()
             before = len(recorder.sent)
 
-            # Backdate the notification clock past the cooldown.
             stale = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
             async with _connect(db._db_path) as conn:
                 await conn.execute("UPDATE active_alerts SET last_notified_at = ?", (stale,))
@@ -363,7 +342,6 @@ class TestSuppressionAndFlapping:
             await engine.evaluate_once()
             assert await db.get_active_alert("caddy-availability:fast") is not None
 
-            # Metric recovers.
             async with _connect(config.db_path) as conn:
                 await conn.execute("DELETE FROM caddy_metrics")
                 await conn.commit()
@@ -395,14 +373,13 @@ class TestSuppressionAndFlapping:
             async with _connect(config.db_path) as conn:
                 await conn.execute("DELETE FROM caddy_metrics")
                 await conn.commit()
+
             now = datetime.now(UTC)
             await _seed_caddy(
                 config.db_path,
                 [(100.0, 0.0, now - timedelta(minutes=m)) for m in range(0, 50)],
             )
 
-            # First quiet tick starts the grace timer; second resolves it,
-            # because resolve_after_seconds is zero.
             await engine.evaluate_once()
             await engine.evaluate_once()
 
@@ -412,12 +389,8 @@ class TestSuppressionAndFlapping:
             await db.aclose()
 
 
-# ---------------------------------------------------------------------------
-# Dispatchers
-# ---------------------------------------------------------------------------
-
-
 def _payload(status: str = "firing") -> AlertPayload:
+
     return AlertPayload(
         alert_key="caddy-availability:fast",
         slo_name="caddy-availability",
@@ -450,6 +423,7 @@ class TestDispatchers:
         route = respx_mock.post(SLACK_URL).mock(return_value=httpx.Response(200, text="ok"))
         async with httpx.AsyncClient() as client:
             assert await SlackDispatcher(SLACK_URL, client, 5.0).send(_payload()) is True
+
         assert route.called
         assert "blocks" in route.calls[0].request.content.decode()
 
@@ -476,6 +450,7 @@ class TestMissingChannel:
         db, _config = await _breaching_db(tmp_path)
         try:
             engine = AlertEngine(_alerting_config(), db, dispatchers=[])
+
             fired = await engine.evaluate_once()
             assert fired, "the breach should still be detected"
             rows = await db.query_active_alerts(status="firing")
@@ -491,6 +466,7 @@ class TestMissingChannel:
                 await engine.dispatch(_payload())
                 await engine.dispatch(_payload())
             complaints = [r for r in caplog.records if "no notification channel" in r.message]
+
             assert len(complaints) == 1, "the warning must not repeat for every alert"
         finally:
             await db.aclose()

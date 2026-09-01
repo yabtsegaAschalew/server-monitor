@@ -31,11 +31,13 @@ class FakeSleeper:
         self.calls: list[float] = []
 
     async def __call__(self, seconds: float) -> None:
+
         self.calls.append(seconds)
         await asyncio.sleep(0)
 
 
 async def wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
+
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.001)
@@ -50,10 +52,15 @@ class FakeProcReader:
         self.mem_buffers_kb = 500_000
         self.mem_cached_kb = 3_000_000
         self.mem_sreclaimable_kb = 500_000
+        self.mem_available_kb = None
         self.disk_read_sectors = 1000
         self.disk_write_sectors = 2000
         self.net_sent_bytes = 3000
         self.net_recv_bytes = 4000
+        self.lo_recv_bytes = 9_000_000
+        self.lo_sent_bytes = 9_000_000
+        self.docker0_recv_bytes = 50_000
+        self.docker0_sent_bytes = 40_000
         self.load1 = "1.5"
         self.psi_cpu = "some avg10=0.50 avg60=0.30"
         self.psi_mem = "some avg10=1.20 avg60=0.80"
@@ -64,9 +71,11 @@ class FakeProcReader:
         if p.endswith("/stat"):
             return f"cpu  {self.cpu_total - self.cpu_idle} 0 0 {self.cpu_idle} 0 0 0 0 0 0\n"
         if p.endswith("/meminfo"):
+            available = f"MemAvailable:   {self.mem_available_kb} kB\n" if self.mem_available_kb is not None else ""
             return (
                 f"MemTotal:       {self.mem_total_kb} kB\n"
                 f"MemFree:        {self.mem_free_kb} kB\n"
+                f"{available}"
                 f"Buffers:        {self.mem_buffers_kb} kB\n"
                 f"Cached:         {self.mem_cached_kb} kB\n"
                 f"SReclaimable:   {self.mem_sreclaimable_kb} kB\n"
@@ -76,11 +85,17 @@ class FakeProcReader:
         if p.endswith("/net/dev"):
             hdr = "Inter|face bytes packets errs drop fifo frame compressed multicast|"
             tail = "bytes packets errs drop fifo frame compressed\n"
-            return f"{hdr}{tail}  eth0: {self.net_recv_bytes} 0 0 0 0 0 0 0 {self.net_sent_bytes} 0 0 0 0 0 0 0\n"
+            return (
+                f"{hdr}{tail}"
+                f"  lo: {self.lo_recv_bytes} 0 0 0 0 0 0 0 {self.lo_sent_bytes} 0 0 0 0 0 0 0\n"
+                f"  eth0: {self.net_recv_bytes} 0 0 0 0 0 0 0 {self.net_sent_bytes} 0 0 0 0 0 0 0\n"
+                f"  docker0: {self.docker0_recv_bytes} 0 0 0 0 0 0 0 {self.docker0_sent_bytes} 0 0 0 0 0 0 0\n"
+            )
         if p.endswith("/loadavg"):
             return f"{self.load1} 1.2 1.0 1/400 1234\n"
         if p.endswith("/pressure/cpu"):
             return f"{self.psi_cpu}\nfull avg10=0.10\n"
+
         if p.endswith("/pressure/memory"):
             return f"{self.psi_mem}\nfull avg10=0.40\n"
         if p.endswith("/pressure/io"):
@@ -98,6 +113,7 @@ def fake_proc(
     mem_buffers_kb: int = 500_000,
     mem_cached_kb: int = 3_000_000,
     mem_sreclaimable_kb: int = 500_000,
+    mem_available_kb: int | None = None,
     disk_read_sectors: int = 1000,
     disk_write_sectors: int = 2000,
     net_sent_bytes: int = 3000,
@@ -115,12 +131,15 @@ def fake_proc(
     reader.mem_buffers_kb = mem_buffers_kb
     reader.mem_cached_kb = mem_cached_kb
     reader.mem_sreclaimable_kb = mem_sreclaimable_kb
+    reader.mem_available_kb = mem_available_kb
     reader.disk_read_sectors = disk_read_sectors
     reader.disk_write_sectors = disk_write_sectors
     reader.net_sent_bytes = net_sent_bytes
+
     reader.net_recv_bytes = net_recv_bytes
     reader.load1 = load1
     reader.psi_cpu = psi_cpu
+
     reader.psi_mem = psi_mem
     reader.psi_io = psi_io
     monkeypatch.setattr("collectors.system_health._DEFAULT_READER", reader)
@@ -174,13 +193,74 @@ async def test_host_metric_collection_mocked(monkeypatch) -> None:
     assert metric.cpu_percent == pytest.approx(50.0)
     assert metric.memory_percent == pytest.approx(62.5)
     assert metric.disk_read_bps == 0.0
+
     assert metric.disk_write_bps == 0.0
     assert metric.net_bytes_sent_per_sec == 0.0
     assert metric.net_bytes_recv_per_sec == 0.0
     assert metric.load_avg == 1.5
     assert metric.psi_cpu_some_avg10 == 0.50
     assert metric.psi_memory_some_avg10 == 1.20
+
     assert metric.psi_io_some_avg10 == 0.10
+
+
+async def test_memory_usage_prefers_memavailable_over_legacy_equation(monkeypatch) -> None:
+    fake_proc(monkeypatch, mem_available_kb=12_000_000)
+
+    collector = HostMetricsCollector("node-01")
+
+    metric = await collector.collect()
+
+    assert metric.memory_percent == pytest.approx(25.0)
+
+
+async def test_memory_usage_falls_back_to_legacy_equation_without_memavailable(monkeypatch) -> None:
+    fake_proc(monkeypatch, mem_available_kb=None)
+    collector = HostMetricsCollector("node-01")
+
+    metric = await collector.collect()
+
+    assert metric.memory_percent == pytest.approx(62.5)
+
+
+async def test_network_rate_excludes_loopback_and_virtual_interfaces(monkeypatch) -> None:
+    reader = fake_proc(
+        monkeypatch,
+        net_sent_bytes=0,
+        net_recv_bytes=0,
+    )
+    clock = FakeClock()
+    monkeypatch.setattr("collectors.system_health.time.monotonic", clock)
+
+    reader.lo_recv_bytes = 9_000_000
+    reader.lo_sent_bytes = 9_000_000
+    reader.docker0_recv_bytes = 500_000
+    reader.docker0_sent_bytes = 400_000
+    collector = HostMetricsCollector("node-01")
+    await collector.collect()
+
+    reader.net_recv_bytes = 3000
+    reader.net_sent_bytes = 4000
+    clock.advance(2.0)
+    metric = await collector.collect()
+
+    assert metric.net_bytes_recv_per_sec == pytest.approx(1500.0)
+    assert metric.net_bytes_sent_per_sec == pytest.approx(2000.0)
+
+
+async def test_daemon_from_config_propagates_host_disk_path() -> None:
+    config = ConfigManager(
+        polling={"interval_seconds": 5.0},
+        thresholds={},
+        collectors={
+            "host": {"host_id": "node-x", "disk_path": "/some/mount"},
+            "caddy": {"instance_id": "edge-01", "metrics_url": CADDY_METRICS_URL},
+        },
+    )
+
+    daemon = SystemHealthDaemon.from_config(config)
+
+    assert daemon._host._disk_path == "/some/mount"
 
 
 async def test_host_rates_computed_from_counter_delta(monkeypatch) -> None:
@@ -223,10 +303,12 @@ async def test_host_rates_clamp_to_zero_after_counter_reset(monkeypatch) -> None
     await collector.collect()
 
     reader.disk_read_sectors = 0
+
     reader.disk_write_sectors = 0
     reader.net_sent_bytes = 0
     reader.net_recv_bytes = 0
     clock.advance(1.0)
+
     metric = await collector.collect()
 
     assert metric.disk_read_bps == 0.0
@@ -248,11 +330,13 @@ async def test_caddy_scrape_with_details_extracts_status_distribution(respx_mock
     assert result.metric.active_conns == 42
     assert result.histogram_buckets[0] == (0.005, 200.0)
     assert result.histogram_buckets[-1][0] == float("inf")
+
     await scraper.aclose()
 
 
 async def test_daemon_runs_loops_on_configured_intervals(monkeypatch, respx_mock) -> None:
     respx_mock.get(CADDY_METRICS_URL).mock(return_value=httpx.Response(200, text=caddy_text()))
+
     fake_proc(monkeypatch)
     sleeper = FakeSleeper()
     daemon = make_daemon(sleeper=sleeper, host_interval=0.25, caddy_interval=15.0)
@@ -274,6 +358,7 @@ async def test_daemon_runs_loops_on_configured_intervals(monkeypatch, respx_mock
         assert 15.0 in sleeper.calls
     finally:
         await daemon.stop()
+
         await task
         await daemon.aclose()
 
@@ -313,8 +398,10 @@ async def test_host_failure_is_contained(monkeypatch, respx_mock) -> None:
     original_read_text = FakeProcReader.read_text
 
     def boom(self_inner, path):
+
         if str(path).endswith("/meminfo"):
             raise RuntimeError("memory read failed")
+
         return original_read_text(self_inner, path)
 
     monkeypatch.setattr(FakeProcReader, "read_text", boom)

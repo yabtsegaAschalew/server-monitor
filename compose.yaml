@@ -40,9 +40,6 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     networks: [monitor-net]
-    # Maps host.docker.internal to the Docker bridge gateway so the caddy
-    # collector can reach a Caddy running on the host without hardcoding a
-    # machine-specific LAN/bridge IP.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # SECURITY: least privilege. This process reads telemetry and writes SQLite;
@@ -53,26 +50,18 @@ services:
     security_opt: [no-new-privileges:true]
     tmpfs:
       - /tmp
-    # Bounds the memory-growth vectors (SNMP walks, crash-loop windows) at the
-    # container edge, well under the project's <100 MB design target.
     mem_limit: 128m
     environment:
       DOCKER_BASE_URL: http://docker-socket-proxy:2375
       MONITOR_DB_PATH: /data/monitoring.db
       UV_CACHE_DIR: /tmp/uv-cache
-      # Point the host collector at the bind-mounted host filesystems.
       HOST_ROOT: /host
     volumes:
-      # The only writable path — SQLite plus its -wal and -shm sidecars.
       - monitor-data:/data
-      # Read-only host filesystems so the host collector reports the real
-      # machine (its /proc, /sys, /etc) rather than the container's own view.
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /etc:/host/etc:ro
-    # The entrypoint is `python -m main`, whose parser requires a subcommand.
-    # Without the leading "collectors" argparse exits 2 and restart:
-    # unless-stopped turns it into a crash loop.
+      - /:/host/root:ro
     command: ["collectors", "--collectors", "host,caddy,docker,network"]
     depends_on:
       - docker-socket-proxy

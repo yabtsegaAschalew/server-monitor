@@ -21,14 +21,8 @@ CADDY_REQUESTS_TOTAL = "caddy_http_requests_total"
 CADDY_DURATION_HISTOGRAM = "caddy_http_request_duration_seconds"
 CADDY_IN_FLIGHT = "caddy_http_requests_in_flight"
 
-# The scrape streams at the transport layer but still materialises the filtered
-# lines. A Caddy with high label cardinality can emit tens of thousands of
-# series per family, so cap what we retain rather than trusting the endpoint.
 _MAX_LINES_PER_FAMILY = 50_000
 
-# Explicit end-to-end bound. httpx's default 5s read timeout applies per chunk,
-# so a slow-drip endpoint could hold the stream open indefinitely without ever
-# tripping it.
 _SCRAPE_TIMEOUT = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
 _SCRAPE_DEADLINE_SECONDS = 30.0
 
@@ -50,11 +44,13 @@ class CaddyScrapeResult:
     metric: CaddyMetric
     two_xx: float
     four_xx: float
+
     five_xx: float
     histogram_buckets: tuple[tuple[float, float], ...] = ()
 
 
 def _histogram_quantile(quantile: float, buckets: list[tuple[float, float]]) -> float:
+
     if not buckets:
         return 0.0
     total = buckets[-1][1]
@@ -68,6 +64,7 @@ def _histogram_quantile(quantile: float, buckets: list[tuple[float, float]]) -> 
             width = count - previous_count
             if width <= 0.0:
                 return previous_upper
+
             fraction = (rank - previous_count) / width
             return previous_upper + (upper - previous_upper) * fraction
         previous_upper, previous_count = upper, count
@@ -118,12 +115,6 @@ class CaddyScraper:
                                     current_family = candidate
                                 line_bufs[current_family].append(stripped)
                             else:
-                                # Must reset, exactly as the HELP branch does.
-                                # Leaving current_family pointing at the previous
-                                # (known) family made every sample line of this
-                                # unrelated family get parsed as if it belonged
-                                # to it, silently corrupting request counts,
-                                # error rate and p99.
                                 current_family = None
                         elif current_family is not None:
                             buf = line_bufs[current_family]
@@ -138,9 +129,7 @@ class CaddyScraper:
                                 continue
                             buf.append(stripped)
         except TimeoutError as exc:
-            raise CaddyScrapeError(
-                f"GET {self._config.metrics_url} exceeded {_SCRAPE_DEADLINE_SECONDS:.0f}s"
-            ) from exc
+            raise CaddyScrapeError(f"GET {self._config.metrics_url} exceeded {_SCRAPE_DEADLINE_SECONDS:.0f}s") from exc
         except httpx.HTTPError as exc:
             raise CaddyScrapeError(f"GET {self._config.metrics_url} failed: {exc}") from exc
         return line_bufs

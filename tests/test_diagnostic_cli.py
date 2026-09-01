@@ -53,6 +53,7 @@ class TestAnomalyKeyParsing:
 
     @pytest.mark.parametrize("bad", ["host", "host:", ":localhost", ""])
     def test_rejects_malformed_keys(self, bad: str) -> None:
+
         with pytest.raises(ValueError, match="expected"):
             cli.split_anomaly_type(bad)
 
@@ -85,6 +86,7 @@ class TestParserWiring:
     def test_subcommand_is_required(self) -> None:
         parser = argparse.ArgumentParser()
         cli.add_arguments(parser)
+
         with pytest.raises(SystemExit):
             parser.parse_args([])
 
@@ -111,7 +113,6 @@ class TestReviewIsStatusOnly:
             assert len(rows) == 1
             assert rows[0]["id"] == rule_id
             assert rows[0]["reviewed_by"] == "tester"
-            # The plan text is untouched — approval does not consume it.
             assert "rm -rf /tmp/nothing" in rows[0]["action_plan_json"]
 
     async def test_reject_sets_rejected(self, tmp_path: Path) -> None:
@@ -130,8 +131,9 @@ class TestReviewIsStatusOnly:
 
     async def test_missing_rule_reports_cleanly(self, tmp_path: Path, capsys) -> None:
         config = _config(tmp_path)
+
         async with DatabaseEngine(config.collectors.database) as db:
-            assert db is not None  # create the schema
+            assert db is not None
         await cli.run_review(config, 4242, "approved")
         assert "not found" in capsys.readouterr().out
 
@@ -154,6 +156,7 @@ class TestListRules:
 
     async def test_empty_listing_says_so(self, tmp_path: Path, capsys) -> None:
         config = _config(tmp_path)
+
         async with DatabaseEngine(config.collectors.database) as db:
             assert db is not None
         await cli.run_list_rules(config, status="pending")

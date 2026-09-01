@@ -38,28 +38,16 @@ from .errors import CollectorError
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ICMP constants
-# ---------------------------------------------------------------------------
 _ICMP_ECHO_REQUEST = 8
 _ICMP_ECHO_REPLY = 0
 _ICMP_DGRAM_MAX_RECV = 2048
-# Written into the outgoing identifier field. Meaningful only on SOCK_RAW; on
-# SOCK_DGRAM the kernel overwrites it with the socket's ephemeral port, which is
-# why replies are correlated by sequence number instead. See _parse_icmp_reply.
 _ICMP_PID = os.getpid() & 0xFFFF
 
-# Rolling stats window per target
 _ICMP_STATS_MAXLEN = 100
 
 
 class NetworkProbeError(CollectorError):
     pass
-
-
-# ---------------------------------------------------------------------------
-# ICMP helpers
-# ---------------------------------------------------------------------------
 
 
 def _icmp_checksum(data: bytes) -> int:
@@ -70,6 +58,7 @@ def _icmp_checksum(data: bytes) -> int:
     for i in range(0, len(data), 2):
         total += (data[i] << 8) + data[i + 1]
     total = (total >> 16) + (total & 0xFFFF)
+
     total += total >> 16
     return ~total & 0xFFFF
 
@@ -80,12 +69,10 @@ def _build_icmp_echo(seq: int, payload_size: int = 64) -> bytes:
     Payload contains an 8-byte monotonic timestamp followed by zero-padding.
     The total ICMP packet is 8 (header) + payload_size bytes.
     """
-    # Payload: 8-byte timestamp + padding
     ts_bytes = struct.pack("!d", time.monotonic())
     padding_len = max(0, payload_size - len(ts_bytes))
     payload = ts_bytes + b"\x00" * padding_len
 
-    # Header with checksum=0 for computation
     header = struct.pack("!BBHHH", _ICMP_ECHO_REQUEST, 0, 0, _ICMP_PID, seq)
     cksum = _icmp_checksum(header + payload)
     header = struct.pack("!BBHHH", _ICMP_ECHO_REQUEST, 0, cksum, _ICMP_PID, seq)
@@ -111,17 +98,12 @@ def _parse_icmp_reply(data: bytes) -> tuple[int, int, float] | None:
     icmp_type, _icmp_code, _cksum, recv_ident, recv_seq = struct.unpack("!BBHHH", data[:8])
     if icmp_type != _ICMP_ECHO_REPLY:
         return None
-    # Extract the timestamp embedded in the reply payload (bytes 8-16)
+
     if len(data) >= 16:
         ts = struct.unpack("!d", data[8:16])[0]
     else:
         ts = 0.0
     return recv_ident, recv_seq, ts
-
-
-# ---------------------------------------------------------------------------
-# ICMP ping engine
-# ---------------------------------------------------------------------------
 
 
 class IcmpPingEngine:
@@ -156,12 +138,9 @@ class IcmpPingEngine:
         self._now_fn = now
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
-        # In-flight: seq -> (target, send_time). Keyed by sequence number only;
-        # see _parse_icmp_reply for why the identifier field is not usable.
         self._in_flight: dict[int, tuple[IcmpTarget, float]] = {}
         self._seq = 0
         self._sock: socket.socket | None = None
-        # Per-target rolling stats
         self._stats: dict[str, _PingStats] = {}
 
     def _open_socket(self) -> socket.socket | None:
@@ -243,9 +222,6 @@ class IcmpPingEngine:
             if i < target.count - 1:
                 await self._sleeper(target.interval_seconds)
 
-        # Wait only on THIS target's outstanding probes. Waiting on the shared
-        # _in_flight dict meant one target's unanswered packets stalled every
-        # other target's cycle.
         try:
             async with asyncio.timeout(target.timeout_seconds):
                 while any(seq in self._in_flight for seq in issued):
@@ -253,9 +229,6 @@ class IcmpPingEngine:
         except TimeoutError:
             pass
 
-        # Reap this cycle's unanswered probes plus any stragglers from earlier
-        # cycles, so _in_flight cannot grow without bound. Loss is derived from
-        # sent-vs-received, so expiry needs no separate accounting.
         now = self._now_fn()
         for seq in list(self._in_flight):
             entry = self._in_flight.get(seq)
@@ -266,8 +239,6 @@ class IcmpPingEngine:
         received = stats.received
         loss = ((sent - received) / sent * 100.0) if sent > 0 else 0.0
 
-        # min/avg/max come from the bounded rolling window (as the model fields
-        # document); loss comes from this cycle only.
         rtt_vals = stats.window_rtts()
         avg = sum(rtt_vals) / len(rtt_vals) if rtt_vals else 0.0
         mn = min(rtt_vals) if rtt_vals else 0.0
@@ -276,7 +247,7 @@ class IcmpPingEngine:
 
         return IcmpProbeMetric(
             target_host=target.host,
-            target_ip=target.host,  # DGRAM mode doesn't resolve separately
+            target_ip=target.host,
             rtt_ms=last_rtt,
             avg_rtt_ms=avg,
             min_rtt_ms=mn,
@@ -294,10 +265,6 @@ class IcmpPingEngine:
                 for target in self._config.icmp_targets:
                     if self._stop_event.is_set():
                         break
-                    # Budget must cover the send phase as well as the reply
-                    # wait. A flat timeout+5s starved any target configured with
-                    # count * interval greater than 5 seconds, so every one of
-                    # its cycles aborted with a spurious timeout.
                     budget = (target.count - 1) * target.interval_seconds + target.timeout_seconds + 5.0
                     try:
                         async with asyncio.timeout(budget):
@@ -312,7 +279,6 @@ class IcmpPingEngine:
                         logger.exception("ICMP probe failed for %s", target.host)
                 await self._sleeper(self._config.icmp_interval_seconds)
         except asyncio.CancelledError:
-            # Drain in-flight to avoid leaking references
             self._in_flight.clear()
             raise
 
@@ -322,12 +288,6 @@ class IcmpPingEngine:
         self._loop = asyncio.get_running_loop()
         self._sock = self._open_socket()
         if self._sock is None:
-            # Degrade cleanly instead of raising: an exception here propagates
-            # into NetworkCollectorDaemon's TaskGroup and cancels the SNMP
-            # collector as collateral damage. But do NOT return: a returned ICMP
-            # task empties the TaskGroup and makes the whole network daemon exit,
-            # which the supervisor in main.py treats as an early fatal shutdown.
-            # Stay alive (honouring stop_event) so the process keeps running.
             try:
                 await self._stop_event.wait()
             finally:
@@ -347,9 +307,11 @@ class IcmpPingEngine:
             self._stop_event.set()
 
     async def aclose(self) -> None:
+
         await self.stop()
 
     async def __aenter__(self) -> IcmpPingEngine:
+
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -400,18 +362,10 @@ class _PingStats:
         return list(self._rtts)
 
 
-# ---------------------------------------------------------------------------
-# SNMP collector
-# ---------------------------------------------------------------------------
-
-# IF-MIB ifEntry. Every column we care about lives under this prefix; the walk
-# stops as soon as it leaves, so a device cannot lead us through the rest of
-# its MIB tree.
 _IF_TABLE_PREFIX = "1.3.6.1.2.1.2.2.1"
 _SNMP_MAX_REPETITIONS = 50
-# 50 repetitions * 40 rounds = 2000 varbinds, far more than any real ifTable.
-# The cap is what stops an agent that never signals end-of-MIB from growing the
-# accumulator until the process runs out of memory.
+
+
 _SNMP_MAX_WALK_ROUNDS = 40
 
 
@@ -425,6 +379,7 @@ def _in_if_table(var_bind) -> bool:
 
 def _map_auth_protocol(proto: SnmpAuthProtocol):
     """Map our config enum to pysnmp USM auth protocol."""
+
     from pysnmp.hlapi.v3arch.asyncio.auth import (
         usmHMAC192SHA256AuthProtocol,
         usmHMACMD5AuthProtocol,
@@ -486,11 +441,8 @@ class SnmpCollector:
         self._config = config
         self._sleeper = sleeper
         self._stop_event: asyncio.Event | None = None
-        # Per-device previous octet counters for rate computation
-        # Key: (device_id, if_index) -> (in_octets, out_octets, timestamp)
         self._prev_octets: dict[tuple[str, int], tuple[int, int, float]] = {}
         self._prev_ts: dict[str, float] = {}
-        # Built lazily on first poll and reused for the daemon's lifetime.
         self._engine: object | None = None
         self._transports: dict[str, object] = {}
 
@@ -508,17 +460,15 @@ class SnmpCollector:
 
         results: list[SnmpInterfaceMetric] = []
         now = self._now()
-        # Collect all rows from ifTable
         var_bind_table: list = []
         try:
             async with asyncio.timeout(target.timeout_seconds):
-                # Initial GetBulk request
                 error_indication, error_status, _error_index, first_table = await bulk_cmd(
                     snmp_engine,
                     auth_data,
                     transport,
                     ContextData(),
-                    0,  # nonRepeaters
+                    0,
                     _SNMP_MAX_REPETITIONS,
                     ObjectType(ObjectIdentity("IF-MIB", "ifTable")),
                 )
@@ -532,15 +482,6 @@ class SnmpCollector:
                     return results
                 var_bind_table = [vb for vb in first_table if _in_if_table(vb)]
 
-                # Walk on, with three guards the original loop lacked:
-                #   1. is_end_of_mib() is evaluated on the CHUNK just returned,
-                #      not on the whole accumulated list (which never reports
-                #      end-of-MIB once real rows are in it).
-                #   2. A hard round cap, so an agent that never signals
-                #      end-of-MIB cannot grow this list without bound.
-                #   3. A prefix check, so the walk stops at the edge of ifTable
-                #      instead of continuing into unrelated MIB subtrees and
-                #      parsing them as interface columns.
                 last_chunk = list(first_table)
                 rounds = 0
                 while rounds < _SNMP_MAX_WALK_ROUNDS:
@@ -570,14 +511,7 @@ class SnmpCollector:
                         _SNMP_MAX_WALK_ROUNDS,
                     )
 
-            # Parse ifTable rows into per-interface dicts. This runs inside the
             # try: values come from an untrusted device, and a single malformed
-            # integer used to escape and abort the whole poll cycle.
-            #
-            # ifTable base OID: 1.3.6.1.2.1.2.2.1
-            # Columns: 1=ifIndex, 2=ifDescr, 3=ifType, 4=ifMtu, 5=ifSpeed,
-            #   6=ifPhysAddress, 7=ifAdminStatus, 8=ifOperStatus, 10=ifInOctets,
-            #   14=ifInErrors, 16=ifOutOctets, 20=ifOutErrors
             iface_data: dict[int, dict] = {}
             for var_bind in var_bind_table:
                 oid_str = str(var_bind[0])
@@ -609,7 +543,6 @@ class SnmpCollector:
                     elif col == 20:
                         entry["if_out_errors"] = int(val)
                 except (TypeError, ValueError):
-                    # One unusable column must not cost us the whole device.
                     logger.debug("skipping unparsable SNMP value at %s", oid_str)
                     continue
         except TimeoutError:
@@ -619,7 +552,6 @@ class SnmpCollector:
             logger.exception("SNMP IF-MIB walk failed for %s", target.device_id)
             return results
 
-        # Build SnmpInterfaceMetric for each parsed interface
         for if_index, entry in iface_data.items():
             in_octets = entry.get("if_in_octets", 0)
             out_octets = entry.get("if_out_octets", 0)
@@ -635,8 +567,6 @@ class SnmpCollector:
                 out_bps = 0.0
             self._prev_octets[prev_key] = (in_octets, out_octets, now)
 
-            # Model validation can reject an out-of-range counter from a
-            # misbehaving device; skip that interface rather than the device.
             try:
                 metric = SnmpInterfaceMetric(
                     device_id=target.device_id,
@@ -681,12 +611,9 @@ class SnmpCollector:
             next_cmd,
         )
 
-        # Numeric OIDs for HOST-RESOURCES-MIB scalars
-        OID_HR_SYSTEM_DESCR = "1.3.6.1.2.1.25.1.3.0"  # hrSystemDescr.0
-        OID_HR_PROCESSOR_LOAD_1 = "1.3.6.1.2.1.25.3.3.1.2.1"  # hrProcessorLoad.1
-        # hrStorageEntry subtree for walking
+        OID_HR_SYSTEM_DESCR = "1.3.6.1.2.1.25.1.3.0"
+        OID_HR_PROCESSOR_LOAD_1 = "1.3.6.1.2.1.25.3.3.1.2.1"
         OID_HR_STORAGE_ENTRY = "1.3.6.1.2.1.25.2.3.1"
-        # hrStorageTable columns (relative to hrStorageEntry)
         OID_HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
         OID_HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.7"
         OID_HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.8"
@@ -719,11 +646,9 @@ class SnmpCollector:
                     elif ".25.3.3.1.2" in oid_str:
                         hr_cpu = float(val)
 
-                # Walk hrStorageTable to find RAM (hrStorageType == hrStorageRam(2))
                 hr_mem_total: int | None = None
                 hr_mem_used: int | None = None
                 try:
-                    # Track current row's storage type
                     current_storage_type: int | None = None
 
                     last_oid = ObjectIdentity(OID_HR_STORAGE_ENTRY)
@@ -740,18 +665,16 @@ class SnmpCollector:
                         oid, val = next_binds[0]
                         oid_str = str(oid)
                         last_oid = oid
-                        # Detect row boundaries: if we're back to the Type column,
-                        # the previous row (if RAM) was already processed.
                         if oid_str.startswith(OID_HR_STORAGE_TYPE + "."):
                             current_storage_type = int(val)
                         elif oid_str.startswith(OID_HR_STORAGE_SIZE + "."):
-                            if current_storage_type == 2:  # hrStorageRam
+                            if current_storage_type == 2:
                                 hr_mem_total = int(val)
                         elif oid_str.startswith(OID_HR_STORAGE_USED + "."):
-                            if current_storage_type == 2:  # hrStorageRam
+                            if current_storage_type == 2:
                                 hr_mem_used = int(val)
                 except (TimeoutError, OSError):
-                    pass  # Memory query is best-effort
+                    pass
 
                 return SnmpHostMetric(
                     device_id=target.device_id,
@@ -796,9 +719,6 @@ class SnmpCollector:
         """Poll a single SNMPv3 device for interfaces + host resources."""
         from pysnmp.hlapi.v3arch.asyncio import UsmUserData
 
-        # Engine and transport are reused across cycles; only the per-call
-        # credential object is rebuilt. Constructing an SnmpEngine per device
-        # per cycle re-did MIB compilation every minute.
         snmp_engine = self._get_engine()
 
         auth_data_kwargs: dict = {"userName": target.username}
@@ -851,6 +771,7 @@ class SnmpCollector:
         self._stop_event = asyncio.Event()
         try:
             await self._poll_loop(sink)
+
         finally:
             self._close_engine()
 
@@ -867,11 +788,6 @@ class SnmpCollector:
 
     async def __aexit__(self, *_exc: object) -> None:
         await self.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator daemon
-# ---------------------------------------------------------------------------
 
 
 async def _emit(sink: Callable[[object], object], item: object) -> None:
@@ -918,10 +834,6 @@ class NetworkCollectorDaemon:
             if not self._config.icmp_targets and not self._config.snmp_targets:
                 logger.warning("network collector: no ICMP or SNMP targets configured")
 
-            # Keep the TaskGroup alive for the daemon's lifetime. Without a live
-            # task the group exits as soon as the last sub-engine returns (which
-            # happens when ICMP cannot open a socket), making the whole network
-            # daemon complete and triggering a premature shutdown in main.py.
             self._tasks.append(tg.create_task(self._keep_alive(), name="keeps-alive"))
 
     @staticmethod
@@ -929,10 +841,6 @@ class NetworkCollectorDaemon:
         await asyncio.Event().wait()
 
     async def stop(self) -> None:
-        # Set the stop flags first so a loop between sleeps exits cleanly, then
-        # cancel: the loops spend most of their time inside a sleep of up to
-        # snmp_interval_seconds (60s by default), and waiting that out on every
-        # shutdown is not acceptable.
         if self._icmp is not None:
             await self._icmp.stop()
         if self._snmp is not None:

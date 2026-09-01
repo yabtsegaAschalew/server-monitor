@@ -15,7 +15,6 @@ from .state import DiagnosticState
 
 logger = logging.getLogger(__name__)
 
-
 _PRIMARY_LIMIT = 20
 _CONTEXT_LIMIT = 10
 
@@ -41,27 +40,14 @@ async def _cross_layer_query(
     """Gather metrics from this entity plus cross-layer context for root-cause analysis."""
     snapshot: dict = {}
     if metric_type == MetricType.HOST:
-        snapshot["host"] = _recent(
-            await db.query_recent_host_metrics(entity_id, minutes=minutes), _PRIMARY_LIMIT
-        )
+        snapshot["host"] = _recent(await db.query_recent_host_metrics(entity_id, minutes=minutes), _PRIMARY_LIMIT)
     elif metric_type == MetricType.CADDY:
-        snapshot["caddy"] = _recent(
-            await db.query_recent_caddy_metrics(entity_id, minutes=minutes), _PRIMARY_LIMIT
-        )
+        snapshot["caddy"] = _recent(await db.query_recent_caddy_metrics(entity_id, minutes=minutes), _PRIMARY_LIMIT)
     elif metric_type == MetricType.DOCKER:
-        snapshot["docker"] = _recent(
-            await db.query_recent_docker_events(entity_id, minutes=minutes), _PRIMARY_LIMIT
-        )
+        snapshot["docker"] = _recent(await db.query_recent_docker_events(entity_id, minutes=minutes), _PRIMARY_LIMIT)
     elif metric_type == MetricType.NETWORK:
-        # icmp_probes, not network_probes: nothing writes network_probes, so the
-        # network branch always came back empty.
-        snapshot["network"] = _recent(
-            await db.query_recent_icmp_probes(entity_id, minutes=minutes), _PRIMARY_LIMIT
-        )
+        snapshot["network"] = _recent(await db.query_recent_icmp_probes(entity_id, minutes=minutes), _PRIMARY_LIMIT)
 
-    # Cross-layer context for correlation, regardless of what triggered. Entity
-    # IDs come from config — they were hardcoded to "localhost" / "edge-01",
-    # which silently produced empty context for any non-default deployment.
     if metric_type != MetricType.HOST:
         snapshot["host_context"] = _recent(
             await db.query_recent_host_metrics(cfg.collectors.host.host_id, minutes=minutes),
@@ -73,10 +59,7 @@ async def _cross_layer_query(
             _CONTEXT_LIMIT,
         )
     if metric_type != MetricType.DOCKER:
-        # Any container, not container_id = '' (which matched nothing).
-        snapshot["docker_context"] = _recent(
-            await db.query_recent_docker_events_any(minutes=minutes), _CONTEXT_LIMIT
-        )
+        snapshot["docker_context"] = _recent(await db.query_recent_docker_events_any(minutes=minutes), _CONTEXT_LIMIT)
     return snapshot
 
 
@@ -94,6 +77,7 @@ def sanitize_telemetry(data: Any, *, max_depth: int = 8) -> Any:
         return [sanitize_telemetry(v, max_depth=max_depth - 1) for v in data]
     if isinstance(data, str):
         return _escape_string(data)[:1000]
+
     if isinstance(data, (int, float, bool)) or data is None:
         return data
     return str(data)[:1000]
@@ -115,6 +99,7 @@ def _escape_string(s: str) -> str:
     This is defence in depth, not the whole defence — the system prompt also
     declares the block untrusted. See providers/gemini.py.
     """
+
     return (
         s.replace("\x00", "")
         .replace("\r", "\\r")
@@ -190,6 +175,7 @@ async def evaluate_metrics(
 def _coerce_metric_type(value: object) -> MetricType:
     if isinstance(value, MetricType):
         return value
+
     return MetricType(str(value))
 
 
@@ -212,19 +198,23 @@ async def run_diagnostics(
     if state.get("cooldown_active") or state.get("rate_limit_exceeded"):
         return {"action_plan": None, "error": "guardrail_blocked"}
 
-    if not state.get("threshold_breaches"):
-        # No breach, no paid call. The daemon previously invoked the model for
-        # every entity on every cycle regardless of whether anything was wrong,
-        # which with the shipped empty `thresholds: {}` meant paying to analyse
-        # healthy systems on a loop. This is also what the CLI's "no breach
-        # detected" message has always claimed to do.
-        logger.debug("no threshold breach for %s; skipping provider call", anomaly_type)
+    breaches = state.get("threshold_breaches", [])
+    if not breaches:
+        logger.info("diagnostic: no threshold breach for %s; skipping provider call", anomaly_type)
         return {"action_plan": None, "error": "no_breach_detected"}
+
+    breach_summary = ", ".join(f"{b.get('field')}={b.get('value')} {b.get('level')}" for b in breaches)
+    logger.info(
+        "diagnostic: analyzing anomaly %s (breaches: %s) over %s window",
+        anomaly_type,
+        breach_summary or "none",
+        state.get("evaluation_window_minutes", "?"),
+    )
 
     sanitized = sanitize_telemetry(state.get("telemetry_snapshot", {}))
     telemetry = {
         "anomaly_type": anomaly_type,
-        "threshold_breaches": state.get("threshold_breaches", []),
+        "threshold_breaches": breaches,
         "metrics": sanitized,
     }
 
@@ -262,6 +252,14 @@ async def run_diagnostics(
         success=True,
     )
     await guardrails.record_trigger(anomaly_type)
+
+    logger.info(
+        "diagnostic: %s => severity=%s root_cause=%r (%d suggested command(s))",
+        anomaly_type,
+        plan.severity.value,
+        plan.root_cause,
+        len(plan.suggested_commands),
+    )
 
     return {
         "sanitized_telemetry": telemetry,

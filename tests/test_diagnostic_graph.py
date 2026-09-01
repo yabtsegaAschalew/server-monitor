@@ -62,6 +62,7 @@ class FakeProvider(AIProvider):
 
 
 async def test_full_graph_writes_proposed_rule(tmp_path: Path) -> None:
+
     config = _config(tmp_path)
     async with DatabaseEngine(config.collectors.database) as db:
         await db.write(
@@ -105,6 +106,7 @@ async def test_full_graph_writes_proposed_rule(tmp_path: Path) -> None:
         assert result["threshold_breaches"], "expected at least one breach"
 
         rules = await db.query_proposed_rules(status="pending")
+
         assert len(rules) == 1
         assert rules[0]["severity"] == "critical"
         assert "nginx" in rules[0]["action_plan_json"]
@@ -139,6 +141,7 @@ async def test_agent_analyze_anomaly_via_graph(tmp_path: Path) -> None:
 
         plan = await agent.analyze_anomaly(MetricType.HOST, "localhost")
         assert plan is not None
+
         assert plan.requires_human_approval is True
         assert plan.severity == Severity.CRITICAL
 
@@ -173,4 +176,4 @@ async def test_agent_cooldown_blocks_second_analyze(tmp_path: Path) -> None:
         first = await agent.analyze_anomaly(MetricType.HOST, "localhost")
         assert first is not None
         second = await agent.analyze_anomaly(MetricType.HOST, "localhost")
-        assert second is None  # blocked by cooldown
+        assert second is None

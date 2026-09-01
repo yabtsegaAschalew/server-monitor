@@ -53,11 +53,6 @@ def _host_metric(i: int) -> HostMetric:
     )
 
 
-# ---------------------------------------------------------------------------
-# Model shape
-# ---------------------------------------------------------------------------
-
-
 class TestModelShape:
     """Per-instance cost of the telemetry models.
 
@@ -105,10 +100,7 @@ class TestModelShape:
         has_dict = hasattr(instance, "__dict__")
         with capsys.disabled():
             print(f"  {name}: __dict__={has_dict} __slots__={hasattr(type(instance), '__slots__')}")
-        # Deliberately not asserted — see the class docstring. If every model
-        # reports __dict__=True, the slots=True config keys are inert and
-        # should either be removed or replaced with pydantic dataclasses.
-        assert name  # keeps the test meaningful if the print is swallowed
+        assert name
 
     def test_ten_thousand_metrics_stay_small(self) -> None:
         tracemalloc.start()
@@ -119,17 +111,9 @@ class TestModelShape:
             grown = sum(s.size_diff for s in after.compare_to(before, "filename"))
         finally:
             tracemalloc.stop()
+
         assert len(metrics) == 10_000
-        # Generous: a pydantic BaseModel with ~12 fields runs roughly 0.5-1 KB
-        # per instance including its __dict__, so 10k lands in single-digit MB.
-        # The bound is here to catch an order-of-magnitude regression, not to
-        # police a byte count.
         assert grown < 20 * MB, f"10k host metrics used {grown / MB:.1f} MB"
-
-
-# ---------------------------------------------------------------------------
-# Queue bound
-# ---------------------------------------------------------------------------
 
 
 class TestQueueBackpressure:
@@ -143,21 +127,15 @@ class TestQueueBackpressure:
             retention_days=7,
         )
         db = DatabaseEngine(config)
-        # Deliberately not started: with no writer draining it, the queue fills
-        # and every further write must be shed rather than buffered.
         for i in range(5_000):
             await db.write(_host_metric(i))
 
         assert db._queue.qsize() <= 100
+
         assert db.dropped_count > 0, "writes past maxsize must be counted as dropped"
 
     def test_default_queue_bound_matches_the_budget(self) -> None:
         assert DatabaseConfig().queue_maxsize == 1_000
-
-
-# ---------------------------------------------------------------------------
-# SLI aggregation cost
-# ---------------------------------------------------------------------------
 
 
 class TestSliAggregationCost:
@@ -203,19 +181,12 @@ class TestSliAggregationCost:
             finally:
                 tracemalloc.stop()
 
-            # SUM() in SQL returns two numbers either way. Allow generous slack
-            # for allocator noise; a row-materialising regression would be
-            # orders of magnitude, not a factor of a few.
             assert long_cost < short_cost + 5 * MB, (
                 f"6h window cost {long_cost / MB:.2f} MB vs 5m window {short_cost / MB:.2f} MB"
             )
+
         finally:
             await db.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Whole-process ceiling
-# ---------------------------------------------------------------------------
 
 
 class TestProcessCeiling:

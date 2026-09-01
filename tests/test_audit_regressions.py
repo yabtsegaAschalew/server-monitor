@@ -39,11 +39,6 @@ def _caddy_metric(instance_id: str = "edge-01") -> CaddyMetric:
     )
 
 
-# ---------------------------------------------------------------------------
-# A1 — Caddy metrics never reached the database
-# ---------------------------------------------------------------------------
-
-
 def test_to_row_unwraps_caddy_scrape_result() -> None:
     """SystemHealthDaemon emits CaddyScrapeResult, not CaddyMetric.
 
@@ -57,11 +52,13 @@ def test_to_row_unwraps_caddy_scrape_result() -> None:
 
     assert row is not None, "CaddyScrapeResult must be persistable"
     table, values = row
+
     assert table == "caddy"
     assert values[0] == "edge-01"
 
 
 def test_to_row_still_accepts_a_bare_caddy_metric() -> None:
+
     row = _WriterWorker._to_row(_caddy_metric())
     assert row is not None
     assert row[0] == "caddy"
@@ -79,16 +76,13 @@ async def test_caddy_scrape_result_round_trips_to_sqlite(tmp_path: Path) -> None
             rows = await db.query_recent_caddy_metrics("edge-01", minutes=60)
             if rows:
                 break
+
             await asyncio.sleep(0.05)
         assert rows, "caddy metrics must be persisted, not silently dropped"
         assert rows[0]["instance_id"] == "edge-01"
+
     finally:
         await db.aclose()
-
-
-# ---------------------------------------------------------------------------
-# A5 — a single bad batch killed the writer for the process lifetime
-# ---------------------------------------------------------------------------
 
 
 async def test_writer_survives_a_failing_flush(tmp_path: Path) -> None:
@@ -97,8 +91,7 @@ async def test_writer_survives_a_failing_flush(tmp_path: Path) -> None:
     It previously had no exception handling, so one failure stopped all
     persistence while collectors kept scraping and the queue silently filled.
     """
-    # _WriterWorker defines __slots__, so the failure has to be injected by
-    # subclassing rather than by assigning over the bound method.
+
     class FlakyWriter(_WriterWorker):
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # type: ignore[arg-type]
@@ -118,23 +111,20 @@ async def test_writer_survives_a_failing_flush(tmp_path: Path) -> None:
     stop = asyncio.Event()
     task = asyncio.create_task(worker.run(stop))
     try:
-        await queue.put(_caddy_metric())  # this batch raises
-        await queue.put(_caddy_metric("edge-02"))  # this one must still be written
+        await queue.put(_caddy_metric())
+        await queue.put(_caddy_metric("edge-02"))
         for _ in range(50):
             if len(worker.calls) >= 2:
                 break
+
             await asyncio.sleep(0.05)
         assert len(worker.calls) >= 2, "writer stopped consuming after a failed flush"
         assert not task.done(), "writer task must survive a failed flush"
+
     finally:
         stop.set()
         await asyncio.wait_for(task, timeout=5.0)
         await worker.close()
-
-
-# ---------------------------------------------------------------------------
-# A6 — threshold evaluation read the oldest sample, not the newest
-# ---------------------------------------------------------------------------
 
 
 def test_recent_returns_newest_rows_oldest_first() -> None:
@@ -145,7 +135,7 @@ def test_recent_returns_newest_rows_oldest_first() -> None:
     """
     from diagnostic.nodes import _recent
 
-    rows = [{"id": i, "cpu": float(100 - i)} for i in range(50)]  # index 0 = newest
+    rows = [{"id": i, "cpu": float(100 - i)} for i in range(50)]
 
     out = _recent(rows, 20)
 
@@ -153,11 +143,6 @@ def test_recent_returns_newest_rows_oldest_first() -> None:
     assert out[-1]["cpu"] == 100.0, "last element must be the NEWEST row"
     assert out[0]["cpu"] == 81.0, "first element must be the oldest of the newest 20"
     assert "id" not in out[0], "internal id column must be stripped"
-
-
-# ---------------------------------------------------------------------------
-# C5 — failed AI calls escaped the hourly rate limit
-# ---------------------------------------------------------------------------
 
 
 async def test_rate_limit_counts_failed_calls(tmp_path: Path) -> None:
@@ -183,11 +168,6 @@ async def test_rate_limit_counts_failed_calls(tmp_path: Path) -> None:
         assert await db.count_ai_calls_last_hour() == 1
     finally:
         await db.aclose()
-
-
-# ---------------------------------------------------------------------------
-# A16 — the model was called even with nothing wrong
-# ---------------------------------------------------------------------------
 
 
 async def test_run_diagnostics_skips_provider_without_a_breach() -> None:
@@ -225,24 +205,22 @@ async def test_run_diagnostics_skips_provider_without_a_breach() -> None:
     assert guardrails.calls == 0, "a skipped call must not consume cooldown or quota"
 
 
-# ---------------------------------------------------------------------------
-# C7 — environment values could inject YAML structure
-# ---------------------------------------------------------------------------
-
-
 def test_interpolation_cannot_inject_yaml_structure() -> None:
     """Interpolation happens after parsing, so a value stays a value.
 
+
     Substituting into raw YAML text meant an env var containing ": " or "#"
     could change the shape of the config wherever the placeholder was unquoted.
+
+
     """
     tree = {"diagnostic": {"gemini_api_key": "${EVIL}"}}
+
     env = {"EVIL": "key\n  enabled: false  # injected"}
 
     with pytest.raises(ValueError, match="line breaks"):
         interpolate_tree(tree, env)
 
-    # A value with YAML metacharacters but no newline stays a plain scalar.
     out = interpolate_tree({"k": "${V}"}, {"V": "a: b # c &anchor *alias"})
     assert out == {"k": "a: b # c &anchor *alias"}
 
@@ -267,22 +245,17 @@ def test_interpolation_does_not_escape_backslashes_or_quotes() -> None:
     assert interpolate_env("${SECRET}", {"SECRET": secret}) == secret
 
 
-# ---------------------------------------------------------------------------
-# Retention pruning must work on any SQLite build
-# ---------------------------------------------------------------------------
-
-
 async def test_prune_deletes_old_rows(tmp_path: Path) -> None:
     """`DELETE ... LIMIT` needs a compile-time option that is not universal.
 
     The rowid subquery form is portable; this test fails loudly if it regresses.
     """
-    from database import _PruneWorker, _connect
+    from database import _connect, _PruneWorker
 
     config = _db_config(tmp_path, retention_days=1)
     db = DatabaseEngine(config)
     await db.start()
-    await db.aclose()  # creates the schema
+    await db.aclose()
 
     old = (datetime.now(UTC) - timedelta(days=5)).isoformat()
     fresh = datetime.now(UTC).isoformat()

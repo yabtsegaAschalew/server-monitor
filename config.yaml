@@ -1,12 +1,6 @@
 polling:
   interval_seconds: 5.0
 
-# Threshold field names must match the DATABASE COLUMN names (not the pydantic
-# model field names), because evaluate_metrics() compares them against rows read
-# back out of SQLite. See _SCHEMA_DDL in database.py.
-#
-# An empty mapping here means no breach can ever be detected, which in turn
-# means the diagnostic agent has nothing to trigger on.
 thresholds:
   host:
     cpu:
@@ -39,21 +33,18 @@ thresholds:
 collectors:
   host:
     host_id: localhost
+    # disk_path: /
 
   caddy:
     instance_id: edge-01
-    metrics_url: http://192.168.1.17:2020/metrics
+    metrics_url: http://host.docker.internal:2020/metrics
 
   docker:
     transport_mode: tcp_proxy
     base_url: http://localhost:2375
 
   database:
-    # Overridable so the container can write to a mounted volume while the
-    # image itself stays read-only. Defaults to a file in the working directory.
     db_path: "${MONITOR_DB_PATH:monitoring.db}"
-    # Bounded queue = backpressure. When the writer falls behind, ingest sheds
-    # load rather than growing without limit.
     queue_maxsize: 1000
     batch_size: 256
     prune_interval_seconds: 3600
@@ -74,11 +65,6 @@ collectors:
         timeout_seconds: 2.0
         payload_size: 64
 
-    # SNMP is opt-in. A target that declares auth_protocol/priv_protocol but has
-    # no password fails config validation by design (never downgrade to
-    # cleartext) — and a failed config load takes down every collector, not just
-    # SNMP. Uncomment only once SNMP_AUTH_PASSWORD and SNMP_PRIV_PASSWORD hold
-    # real values in .env.
     snmp_targets: []
     # snmp_targets:
     #   - device_id: main-router
@@ -93,27 +79,11 @@ collectors:
     #     poll_interfaces: true
     #     poll_host_resources: true
 
-# ---------------------------------------------------------------------------
-# Phase 4 — multi-burn-rate SLO alerting
-# ---------------------------------------------------------------------------
-#
-# Burn rate = observed_failure_ratio / error_budget. A rate of 1.0 spends the
-# whole budget exactly over slo_window_days. The two classes below are the
-# canonical SRE pair, expressed as intent rather than as bare multipliers:
-#   fast: 2% of budget in 1h  -> 14.4x  (page)
-#   slow: 5% of budget in 6h  ->  6.0x  (ticket)
-#
-# Each class checks a long window AND a short canary window. Both must breach
-# before an alert fires, so a spike that has already passed does not keep
-# paging for the rest of the long window.
 alerting:
   enabled: true
   evaluation_interval_seconds: 60
 
-  # Suppression: minimum gap between notifications for one alert key.
   cooldown_minutes: 15
-  # Flapping protection: a firing alert must stay under threshold this long
-  # before it is allowed to resolve.
   resolve_after_seconds: 300
 
   request_timeout_seconds: 10
@@ -127,8 +97,6 @@ alerting:
   slow_burn_long_window_minutes: 360
   slow_burn_short_window_minutes: 30
 
-  # Notification channels. Empty means unconfigured; with none set, alerts are
-  # still evaluated and recorded in active_alerts but nothing is sent.
   discord_webhook_url: "${DISCORD_WEBHOOK_URL:}"
   slack_webhook_url: "${SLACK_WEBHOOK_URL:}"
   smtp:
@@ -140,10 +108,6 @@ alerting:
     to_addrs: []
     security: starttls
 
-  # Only 'caddy' and 'icmp' are valid sources: an SLI must be a ratio of good
-  # to total events, and a CPU percentage is not one.
-  #
-  # entity_id is the caddy instance_id, or the ICMP target host.
   slos:
     - name: caddy-availability
       source: caddy

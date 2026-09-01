@@ -21,20 +21,10 @@ from .errors import CollectorError
 
 logger = logging.getLogger(__name__)
 
-# read=None is correct for the long-lived event stream, which is idle by design
-# between container events.
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
-# ...but it must not leak into one-shot requests, which would then be able to
-# hang forever against a wedged daemon.
 _REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)
-# An unbounded read timeout cannot detect a half-open connection (no RST), so
-# the stream would block in aiter_lines() forever and the reconnect/backoff
-# logic below would never run. Docker emits events sporadically; five minutes of
-# total silence means the connection is dead, not quiet.
 _STREAM_IDLE_TIMEOUT = 300.0
 
-# Docker container IDs are hex. Validating them keeps an attacker-influenced
-# value from steering a request at a different Docker API path.
 _CONTAINER_ID_RE = re.compile(r"\A[0-9a-fA-F]{12,64}\Z")
 
 
@@ -55,8 +45,10 @@ _DOCKER_STATUSES = frozenset({"created", "start", "stop", "die", "restart", "hea
 
 
 def _parse_int(value: str | int | None) -> int | None:
+
     if value is None:
         return None
+
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -70,6 +62,7 @@ def _failure_reason(status: str, exit_code: int | None, signal: str | None) -> s
         return f"killed by signal {signal}" if signal else "killed"
     if status == "die" and exit_code is not None and exit_code != 0:
         reason = f"exited with code {exit_code}"
+
         if signal:
             reason = f"{reason} (signal {signal})"
         return reason
@@ -86,6 +79,8 @@ def _build_httpx_client(config: DockerConfig) -> httpx.AsyncClient:
     preventing container exec, creation, or deletion via the monitor.
 
     SECURITY: When transport_mode is UNIX_SOCKET, httpx connects directly
+
+
     to the Docker daemon socket. No proxy-mediated restrictions apply.
     The socket's OS permissions (docker group) are the only access control.
     """
@@ -98,6 +93,7 @@ def _build_httpx_client(config: DockerConfig) -> httpx.AsyncClient:
 
 def _build_event_url(config: DockerConfig) -> str:
     """Compute the events endpoint URL.
+
 
     For TCP proxy mode: {base_url}/events
     For UDS mode: http://docker/events (dummy host required by httpx for UDS transport)
@@ -118,9 +114,6 @@ def parse_event(payload: dict) -> DockerEvent | None:
     if not container_id:
         return None
 
-    # Reject anything that is not a plain hex container ID before it reaches the
-    # database, where get_container_stats() would later interpolate it into a
-    # request path.
     if not isinstance(container_id, str) or not _CONTAINER_ID_RE.match(container_id):
         logger.warning("skipping docker event with malformed container id")
         return None
@@ -129,6 +122,7 @@ def parse_event(payload: dict) -> DockerEvent | None:
         return None
 
     exit_code = _parse_int(attributes.get("exitCode"))
+
     try:
         return DockerEvent(
             container_id=container_id,
@@ -177,9 +171,6 @@ class CrashLoopDetector:
             del self._windows[cid]
         self._last_evict = now
 
-        # Backstop: if churn is fast enough that nothing has aged out yet, drop
-        # the least recently active containers. dicts preserve insertion order
-        # and record() re-inserts on each event, so the head is the coldest.
         overflow = len(self._windows) - self._max_tracked
         if overflow > 0:
             for cid in list(self._windows)[:overflow]:
@@ -187,8 +178,6 @@ class CrashLoopDetector:
 
     def record(self, container_id: str, ts: float | None = None) -> bool:
         now = ts if ts is not None else self._now()
-        # Re-insert at the tail so dict order tracks recency for the eviction
-        # backstop above.
         window = self._windows.pop(container_id, None)
         if window is None:
             window = deque()
@@ -243,15 +232,13 @@ class DockerMonitor:
         self.reconnects = 0
         self._stop_event: asyncio.Event | None = None
         self._tasks: list[asyncio.Task[None]] = []
+        self._stream_opened_at: float | None = None
+        self._last_event_time: float | None = None
 
     @classmethod
     def from_config(cls, config: ConfigManager, **kwargs) -> DockerMonitor:
         docker_config = config.collectors.docker
         # SECURITY: Environment overrides allow runtime transport switching.
-        # DOCKER_SOCKET_PATH takes precedence (forces UDS mode).
-        # DOCKER_BASE_URL overrides the TCP proxy target.
-        # DOCKER_EVENTS_URL is supported for backward compatibility with
-        # existing compose deployments — it sets the base URL (strips /events).
         if socket_path := os.environ.get("DOCKER_SOCKET_PATH"):
             docker_config = docker_config.model_copy(
                 update={"transport_mode": DockerTransportMode.UNIX_SOCKET, "socket_path": socket_path}
@@ -259,7 +246,6 @@ class DockerMonitor:
         elif base_url := os.environ.get("DOCKER_BASE_URL"):
             docker_config = docker_config.model_copy(update={"base_url": base_url})
         elif events_url := os.environ.get("DOCKER_EVENTS_URL"):
-            # Backward compat: derive base_url from full events URL
             base = events_url.removesuffix("/events")
             docker_config = docker_config.model_copy(update={"base_url": base})
         kwargs.setdefault("config", docker_config)
@@ -274,18 +260,21 @@ class DockerMonitor:
     def _record_disconnect(self, reason: str) -> None:
         logger.error("docker events stream disconnected: %s", reason)
 
-    async def _consume_stream(self, sink: Callable[[object], object]) -> bool:
+    async def _consume_stream(self, sink: Callable[[object], object], *, since: float | None = None) -> bool:
         received_any = False
+        url = self._event_url
+        if since is not None:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}since={int(since)}"
         try:
-            async with self._client.stream("GET", self._event_url) as response:
+            async with self._client.stream("GET", url) as response:
                 if response.status_code >= 400:
-                    raise DockerStreamError(f"GET {self._event_url} returned status {response.status_code}")
+                    raise DockerStreamError(f"GET {url} returned status {response.status_code}")
+                self._stream_opened_at = self._now()
                 lines = response.aiter_lines()
                 while True:
                     if self._stop_event is not None and self._stop_event.is_set():
                         break
-                    # Bound the wait for the next line. Without this a half-open
-                    # connection parks here forever and never reconnects.
                     try:
                         raw_line = await asyncio.wait_for(anext(lines), timeout=_STREAM_IDLE_TIMEOUT)
                     except StopAsyncIteration:
@@ -298,6 +287,7 @@ class DockerMonitor:
                     if not line:
                         continue
                     received_any = True
+                    self._last_event_time = self._now()
                     try:
                         payload = json.loads(line)
                     except json.JSONDecodeError:
@@ -331,8 +321,9 @@ class DockerMonitor:
                 logger.error("docker events stream giving up after %d reconnect attempts", attempts)
                 break
             received_any = False
+            catch_up_from = self._last_event_time if self._last_event_time is not None else self._stream_opened_at
             try:
-                received_any = await self._consume_stream(sink)
+                received_any = await self._consume_stream(sink, since=catch_up_from)
                 attempts += 1
                 self._record_disconnect("stream closed by server")
             except asyncio.CancelledError:
@@ -362,15 +353,12 @@ class DockerMonitor:
         if not _CONTAINER_ID_RE.match(container_id):
             logger.warning("refusing stats request for malformed container id")
             return None
-        # Derive base from event_url by stripping /events suffix
         base = self._event_url.rsplit("/events", 1)[0]
         url = f"{base}/containers/{container_id}/stats"
         try:
             response = await self._client.get(
                 url,
                 params={"stream": "false", "one-shot": "true"},
-                # Override the client's read=None, which exists for the event
-                # stream and would let this one-shot call hang indefinitely.
                 timeout=_REQUEST_TIMEOUT,
             )
             response.raise_for_status()
@@ -387,8 +375,6 @@ class DockerMonitor:
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
-        # The loop may be parked in a backoff sleep (up to backoff_max_seconds)
-        # or blocked reading the stream; the flag alone will not free it.
         for task in self._tasks:
             if not task.done():
                 task.cancel()
@@ -398,9 +384,6 @@ class DockerMonitor:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks = []
-        # Only now is it safe to close the client — doing it while the event
-        # loop task was still live produced "client has been closed" errors on
-        # every shutdown.
         if self._owns_client:
             await self._client.aclose()
 

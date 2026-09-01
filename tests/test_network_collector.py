@@ -20,10 +20,6 @@ from config import (
 )
 from models import IcmpProbeMetric, SnmpHostMetric, SnmpInterfaceMetric
 
-# ---------------------------------------------------------------------------
-# ICMP helpers
-# ---------------------------------------------------------------------------
-
 
 class TestIcmpChecksum:
     def test_empty_data(self) -> None:
@@ -103,19 +99,15 @@ class TestParseIcmpReply:
     def test_valid_reply(self) -> None:
         ts = 12345.678
         payload = struct.pack("!d", ts)
-        ident = 4242  # an arbitrary kernel-assigned identifier
+        ident = 4242
         header = struct.pack("!BBHHH", 0, 0, 0, ident, 7)
         result = _parse_icmp_reply(header + payload)
         assert result is not None
         parsed_ident, seq, parsed_ts = result
         assert parsed_ident == ident
+
         assert seq == 7
         assert abs(parsed_ts - ts) < 0.001
-
-
-# ---------------------------------------------------------------------------
-# Ping stats
-# ---------------------------------------------------------------------------
 
 
 class TestPingStats:
@@ -142,19 +134,14 @@ class TestPingStats:
         stats.begin_cycle()
         assert stats.sent == 0
         assert stats.received == 0
-        # RTTs are a rolling window across cycles, as the model fields document.
         assert stats.window_rtts() == [10.0]
 
     def test_empty_stats(self) -> None:
+
         stats = _PingStats()
         assert stats.sent == 0
         assert stats.received == 0
         assert stats.window_rtts() == []
-
-
-# ---------------------------------------------------------------------------
-# IcmpPingEngine
-# ---------------------------------------------------------------------------
 
 
 class TestIcmpPingEngine:
@@ -168,7 +155,6 @@ class TestIcmpPingEngine:
 
     async def test_stop_sets_event(self) -> None:
         engine = IcmpPingEngine(self._make_config())
-        # stop() is a no-op before run_forever() - event doesn't exist yet
         await engine.stop()
         assert engine._stop_event is None
 
@@ -181,8 +167,6 @@ class TestIcmpPingEngine:
         seq = 42
         pkt = _build_icmp_echo(seq)
         ts_bytes = pkt[8:16]
-        # A real kernel rewrites the identifier on a DGRAM socket, so the reply
-        # comes back with an identifier we never chose. Correlation is by seq.
         reply_header = struct.pack("!BBHHH", 0, 0, 0, 51234, seq)
         result = _parse_icmp_reply(reply_header + ts_bytes)
         assert result is not None
@@ -199,7 +183,6 @@ class TestIcmpPingEngine:
 
         class _FakeSock:
             def recvfrom(self, _n: int) -> tuple[bytes, tuple[str, int]]:
-                # Identifier deliberately unrelated to our PID.
                 header = struct.pack("!BBHHH", 0, 0, 0, 9999, 7)
                 return header + struct.pack("!d", 0.0), ("127.0.0.1", 0)
 
@@ -224,13 +207,9 @@ class TestIcmpPingEngine:
             raise PermissionError("operation not permitted")
 
         monkeypatch.setattr(socket_mod, "socket", _denied)
+
         engine = IcmpPingEngine(self._make_config())
         assert engine._open_socket() is None
-
-
-# ---------------------------------------------------------------------------
-# SnmpCollector
-# ---------------------------------------------------------------------------
 
 
 class TestSnmpCollector:
@@ -238,6 +217,7 @@ class TestSnmpCollector:
         cfg = NetworkConfig()
         collector = SnmpCollector(cfg)
         assert collector._stop_event is None
+
         await collector.stop()
         assert collector._stop_event is None
 
@@ -245,11 +225,6 @@ class TestSnmpCollector:
         cfg = NetworkConfig()
         async with SnmpCollector(cfg) as collector:
             assert collector._stop_event is None
-
-
-# ---------------------------------------------------------------------------
-# Config models
-# ---------------------------------------------------------------------------
 
 
 class TestNetworkConfig:
@@ -264,20 +239,17 @@ class TestNetworkConfig:
         t = IcmpTarget(host="10.0.0.1")
         assert t.count == 4
         assert t.payload_size == 64
+
         assert t.timeout_seconds == 5.0
 
     def test_snmp_target_defaults(self) -> None:
         t = SnmpTarget(host="10.0.0.2", device_id="r1")
+
         assert t.port == 161
         assert t.auth_protocol == SnmpAuthProtocol.NONE
         assert t.priv_protocol == SnmpPrivProtocol.NONE
         assert t.poll_interfaces is True
         assert t.poll_host_resources is True
-
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
 
 
 class TestModels:
@@ -326,11 +298,6 @@ class TestModels:
         )
         assert m.hr_system_descr == "Linux 6.1"
         assert m.hr_memory_used == 4_000_000_000
-
-
-# ---------------------------------------------------------------------------
-# Database integration (to_row)
-# ---------------------------------------------------------------------------
 
 
 class TestDatabaseToRow:
@@ -391,11 +358,6 @@ class TestDatabaseToRow:
         table, values = result
         assert table == "snmp_host"
         assert values[0] == "r1"
-
-
-# ---------------------------------------------------------------------------
-# NetworkCollectorDaemon
-# ---------------------------------------------------------------------------
 
 
 class TestNetworkCollectorDaemon:

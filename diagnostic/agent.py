@@ -19,8 +19,6 @@ from .state import DiagnosticState
 
 logger = logging.getLogger(__name__)
 
-# Outer bound on one graph invocation: the provider's own LLM timeout plus
-# headroom for the two SQLite nodes on either side of it.
 _GRAPH_TIMEOUT_SECONDS = 60.0
 
 
@@ -42,6 +40,7 @@ def resolve_api_key(config: DiagnosticConfig) -> str | None:
 
 
 def build_provider(config: DiagnosticConfig, api_key: str | None) -> AIProvider | None:
+
     if config.provider == "gemini":
         if not api_key:
             return None
@@ -186,9 +185,6 @@ class DiagnosticAgent:
             "error": None,
         }
 
-        # The provider bounds its own call, but the graph also touches SQLite in
-        # two nodes; an outer deadline keeps one wedged entity from stalling the
-        # daemon's whole scan.
         try:
             result = await asyncio.wait_for(self._graph.ainvoke(initial), timeout=_GRAPH_TIMEOUT_SECONDS)
         except TimeoutError:
@@ -202,7 +198,6 @@ class DiagnosticAgent:
 
     async def aclose(self) -> None:
         await self.stop()
-        # Release the provider's HTTP connection pool.
         if self._provider is not None:
             try:
                 await self._provider.aclose()

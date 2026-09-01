@@ -9,7 +9,6 @@ from typing import Any
 
 import aiosqlite
 
-# collectors/ never imports database, so this direction is cycle-free.
 from collectors.caddy_scraper import CaddyScrapeResult
 from config import DatabaseConfig
 from diagnostic.schema import DIAGNOSTIC_SCHEMA_DDL
@@ -40,6 +39,7 @@ async def _connect(db_path: str) -> AsyncIterator[aiosqlite.Connection]:
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         yield conn
+
 
 _SCHEMA_DDL = """\
 CREATE TABLE IF NOT EXISTS system_metrics (
@@ -163,14 +163,6 @@ CREATE INDEX IF NOT EXISTS idx_ai_diagnostic_logs_created
     ON ai_diagnostic_logs(created_at);
 """
 
-# Phase 4 alerting state. Kept here rather than in diagnostic/schema.py because
-# alerting is not part of the diagnostic package: routing it through there would
-# make database.py depend on a diagnostic module for alerting DDL while
-# alert_engine.py depends on database.py, for no benefit.
-#
-# slo_name / entity_id / burn_class / last_notified_at go beyond a minimal alert
-# row: suppression ("have we notified about this key recently?") and resolution
-# tracking are not implementable without them.
 _ALERTING_SCHEMA_DDL = """\
 CREATE TABLE IF NOT EXISTS active_alerts (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,7 +285,6 @@ class _WriterWorker:
             result = self._to_row(item)
             if result is None:
                 # Never drop silently again: an unrecognised type here is how
-                # every Caddy metric was lost for the lifetime of the process.
                 logger.warning(
                     "dropping unpersistable item of type %s",
                     type(item).__name__,
@@ -362,10 +353,6 @@ class _WriterWorker:
 
     @staticmethod
     def _to_row(item: object) -> tuple[str, tuple[Any, ...]] | None:
-        # SystemHealthDaemon's caddy loop emits CaddyScrapeResult, a wrapper
-        # carrying the CaddyMetric plus a status-code breakdown. Unwrap it or
-        # the isinstance(CaddyMetric) branch below never matches and every
-        # Caddy sample is silently discarded.
         if isinstance(item, CaddyScrapeResult):
             item = item.metric
 
@@ -465,6 +452,7 @@ class _WriterWorker:
         return None
 
     async def close(self) -> None:
+
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
@@ -504,9 +492,6 @@ class _PruneWorker:
             total = 0
             for table in tables:
                 while True:
-                    # `DELETE ... LIMIT` needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT,
-                    # which is a compile-time option that is not universally on.
-                    # The rowid subquery is portable and plans identically.
                     cursor = await conn.execute(
                         f"DELETE FROM {table} WHERE rowid IN ("  # noqa: S608 - table names are module constants
                         f"SELECT rowid FROM {table} WHERE created_at < ? LIMIT ?"
@@ -520,8 +505,6 @@ class _PruneWorker:
                         break
                     await asyncio.sleep(0)
 
-            # active_alerts is pruned separately: it has no created_at column
-            # (adding it to the loop above would raise on every cycle), and a
             # firing alert must never be deleted out from under the engine.
             while True:
                 cursor = await conn.execute(
@@ -536,6 +519,7 @@ class _PruneWorker:
                 await conn.commit()
                 if deleted < CHUNK_SIZE:
                     break
+
                 await asyncio.sleep(0)
 
             if total > 0:
@@ -749,10 +733,6 @@ class DatabaseEngine:
             )
             await conn.commit()
 
-    # ------------------------------------------------------------------
-    # Phase 3 diagnostic agent persistence
-    # ------------------------------------------------------------------
-
     async def query_cooldown_all(self) -> list[tuple[str, str]]:
         async with _connect(self._db_path) as conn:
             cursor = await conn.execute("SELECT anomaly_type, last_triggered_at FROM cooldown_state")
@@ -783,11 +763,6 @@ class DatabaseEngine:
             await conn.commit()
 
     async def count_ai_calls_last_hour(self) -> int:
-        # Count failures as well as successes. Filtering on success = 1 meant a
-        # provider that was erroring — quota exhaustion, a 5xx run, a rejected
-        # response schema — consumed no budget, so the daemon retried every
-        # entity every cycle forever. Failed calls are still billed for input
-        # tokens, so they must count against the cap.
         async with _connect(self._db_path) as conn:
             cursor = await conn.execute(
                 "SELECT COUNT(*) FROM ai_call_log WHERE created_at >= ?",
@@ -894,7 +869,6 @@ class DatabaseEngine:
                 (status, _now_iso(), reviewed_by, rule_id),
             )
             await conn.commit()
-            # Read rowcount before the connection closes.
             updated = cursor.rowcount > 0
         return updated
 
@@ -903,16 +877,6 @@ class DatabaseEngine:
             cursor = await conn.execute("SELECT DISTINCT container_id FROM docker_metrics WHERE container_id != ''")
             rows = await cursor.fetchall()
         return [r[0] for r in rows]
-
-    # ------------------------------------------------------------------
-    # Phase 4 alerting — SLI aggregation
-    # ------------------------------------------------------------------
-    #
-    # These aggregate in SQL rather than returning rows. A six-hour burn window
-    # at a five-second scrape interval is ~4300 rows per SLO per evaluation;
-    # materialising those as dicts every 60s would dominate the <100 MB budget
-    # for no reason, and would also collide with the 500-row LIMIT in
-    # _query_table. SUM() keeps it O(1) in memory regardless of window length.
 
     async def caddy_sli_window(
         self,
@@ -965,10 +929,6 @@ class DatabaseEngine:
         if row is None:
             return (0, 0)
         return (int(row[0]), int(row[1]))
-
-    # ------------------------------------------------------------------
-    # Phase 4 alerting — active alert state
-    # ------------------------------------------------------------------
 
     async def get_active_alert(self, alert_key: str) -> dict[str, Any] | None:
         """Return the currently firing alert for this key, if any."""

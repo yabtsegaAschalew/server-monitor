@@ -62,9 +62,11 @@ class FakeProvider(AIProvider):
 
 
 def test_sanitize_telemetry_escapes_control_chars() -> None:
+
     data = {"host": {"name": "node\x00\x01\r\n<script>"}, "v": 1.5, "ok": True, "none": None}
     out = sanitize_telemetry(data)
     assert "\\u003cscript\\u003e" in out["host"]["name"]
+
     assert "\r" not in out["host"]["name"]
     assert "\n" not in out["host"]["name"]
     assert "\x00" not in out["host"]["name"]
@@ -73,7 +75,6 @@ def test_sanitize_telemetry_escapes_control_chars() -> None:
 def test_sanitize_telemetry_bounds_depth() -> None:
     data = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": 1}}}}}}}}
     out = sanitize_telemetry(data, max_depth=2)
-    # Beyond the depth budget, nested structures collapse to None.
     assert out["a"]["b"]["c"] is None
 
 
@@ -101,6 +102,7 @@ async def test_evaluate_metrics_returns_breaches(tmp_path: Path) -> None:
         }
         result = await evaluate_metrics(state, db, _minimal_config())
         cpu_breach = [b for b in result["threshold_breaches"] if b["field"] == "cpu"]
+
         assert cpu_breach, f"expected cpu breach, got {result['threshold_breaches']}"
         assert cpu_breach[0]["level"] == "critical"
 
@@ -121,6 +123,7 @@ async def test_human_in_the_loop_writes_proposed_rule(tmp_path: Path) -> None:
         }
         result = await human_in_the_loop_validation(state, db)
         assert result["proposed_rule_id"] is not None
+
         rows = await db.query_proposed_rules(status="pending")
         assert len(rows) == 1
         assert rows[0]["severity"] == "high"
@@ -128,6 +131,7 @@ async def test_human_in_the_loop_writes_proposed_rule(tmp_path: Path) -> None:
 
 async def test_human_in_the_loop_rejects_no_plan(tmp_path: Path) -> None:
     config = _db_config(tmp_path)
+
     async with DatabaseEngine(config) as db:
         state = {"anomaly_type": "host:x", "metric_type": "host", "entity_id": "x"}
         result = await human_in_the_loop_validation(state, db)
@@ -147,6 +151,7 @@ async def test_run_diagnostics_invokes_provider_and_logs_call(tmp_path: Path) ->
             "cooldown_active": False,
             "rate_limit_exceeded": False,
         }
+
         result = await run_diagnostics(state, provider, guardrails)
         assert result["action_plan"] is not None
         assert result["action_plan"].requires_human_approval is True

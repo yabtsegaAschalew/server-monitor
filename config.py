@@ -89,21 +89,25 @@ class ThresholdBounds(BaseModel):
 class PollingConfig(BaseModel):
     interval_seconds: float = Field(gt=0.0)
     sliding_window_size: int = Field(default=3, ge=1)
+
     hysteresis_resolve_seconds: float = Field(default=300.0, ge=0.0)
 
 
 class HostConfig(BaseModel):
     host_id: str = "localhost"
+    disk_path: str | None = None
 
 
 class CaddyConfig(BaseModel):
     instance_id: str = "caddy"
+
     metrics_url: str = "http://localhost:2019/metrics"
 
 
 class EndpointTarget(BaseModel):
     endpoint_id: str
     url: str
+
     timeout_ms: float = Field(default=2000.0, gt=0.0)
     check_ssl: bool = True
 
@@ -115,10 +119,12 @@ class EndpointTarget(BaseModel):
 class DockerTransportMode(StrEnum):
     """Transport mode for Docker daemon communication.
 
+
     SECURITY: 'tcp_proxy' routes through a docker-socket-proxy container that
     enforces read-only restrictions (POST=0, EXEC=0), preventing the monitor
     from issuing privileged Docker API calls like exec, container creation,
     or volume deletion.
+
 
     SECURITY: 'unix_socket' connects directly to the Docker daemon socket,
     granting full read/write API access. Use only in development or when the
@@ -143,36 +149,26 @@ class DockerConfig(BaseModel):
 
     model_config = ConfigDict(validate_default=True)
 
-    # --- Transport selection ---
     # SECURITY: tcp_proxy (default) routes through docker-socket-proxy which
     # blocks write/exec Docker API endpoints, limiting blast radius.
     transport_mode: DockerTransportMode = DockerTransportMode.TCP_PROXY
 
-    # TCP proxy mode: base URL of the docker-socket-proxy container.
-    # The events endpoint is derived as {base_url}/events.
-    # In compose: "http://docker-socket-proxy:2375"
-    # Local dev:  "http://localhost:2375"
     base_url: str = "http://localhost:2375"
 
-    # Unix socket mode: filesystem path to the Docker daemon socket.
     # SECURITY: Direct socket access bypasses all proxy-level restrictions.
-    # Only set this in development or when OS-level permissions are sufficient.
     socket_path: str | None = None
 
-    # --- Event stream filtering ---
     filtered_actions: set[str] = Field(default_factory=lambda: {"die", "kill", "oom", "restart"})
 
-    # --- Crash loop detection ---
     crash_loop_window_seconds: float = Field(default=900.0, gt=0.0)
     max_restarts: int = Field(default=3, ge=1)
 
-    # --- Reconnection / backoff ---
     backoff_initial_seconds: float = Field(default=1.0, gt=0.0)
     backoff_max_seconds: float = Field(default=30.0, gt=0.0)
     backoff_jitter_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
+
     max_attempts: int | None = Field(default=None, ge=1)
 
-    # --- Memory budget ---
     event_buffer_maxlen: int = Field(default=100, ge=1)
 
     @model_validator(mode="after")
@@ -184,22 +180,16 @@ class DockerConfig(BaseModel):
 
 class DatabaseConfig(BaseModel):
     db_path: str = Field(default="monitoring.db")
-    # Bounded to apply backpressure to the ingest path. At 1000 items the
-    # worst-case queue occupancy is well under half a megabyte, which keeps the
-    # whole process comfortably inside the <100 MB budget.
     queue_maxsize: int = Field(default=1_000, ge=100)
     batch_size: int = Field(default=256, ge=1, le=10_000)
     prune_interval_seconds: float = Field(default=3600.0, gt=0.0)
+
     retention_days: int = Field(default=7, ge=1)
-
-
-# ---------------------------------------------------------------------------
-# Network collector configuration
-# ---------------------------------------------------------------------------
 
 
 class IcmpTarget(BaseModel):
     """Single ICMP echo probe target.
+
 
     Uses unprivileged SOCK_DGRAM IPPROTO_ICMP sockets — no root required.
     Cannot control TTL or receive TTL in replies (OS limitation of DGRAM mode).
@@ -208,6 +198,7 @@ class IcmpTarget(BaseModel):
     host: str
     count: int = Field(default=4, ge=1, le=50, description="Probes per poll cycle")
     interval_seconds: float = Field(default=1.0, gt=0.0, description="Delay between probes")
+
     timeout_seconds: float = Field(default=5.0, gt=0.0, description="Per-probe timeout")
     payload_size: int = Field(default=64, ge=8, le=1024, description="ICMP payload bytes")
 
@@ -238,22 +229,19 @@ class SnmpTarget(BaseModel):
     port: int = Field(default=161, gt=0)
     timeout_seconds: float = Field(default=10.0, gt=0.0)
 
-    # SNMPv3 USM authentication
     username: str = ""
     auth_protocol: SnmpAuthProtocol = SnmpAuthProtocol.NONE
     auth_password: str = Field(default="", description="Supports ${ENV_VAR} interpolation")
     priv_protocol: SnmpPrivProtocol = SnmpPrivProtocol.NONE
     priv_password: str = Field(default="", description="Supports ${ENV_VAR} interpolation")
 
-    # What to poll
     poll_interfaces: bool = True
+
     poll_host_resources: bool = True
 
     @model_validator(mode="after")
     def _validate_auth(self) -> SnmpTarget:
-        # Deliberately fail closed rather than silently downgrading to no-auth:
         # an SNMPv3 target configured for sha256/aes256 must never fall back to
-        # cleartext because a password happened to be blank.
         if self.auth_protocol != SnmpAuthProtocol.NONE and not self.auth_password:
             raise ValueError(
                 f"snmp target {self.device_id!r} sets auth_protocol={self.auth_protocol.value} "
@@ -269,9 +257,6 @@ class SnmpTarget(BaseModel):
         return self
 
     def resolved_auth_password(self, env: Mapping[str, str] | None = None) -> str:
-        # Already expanded by ConfigManager.from_file. Re-running interpolation
-        # here would expand a literal ${...} that legitimately appears inside a
-        # secret, or raise on one whose name is unset.
         return self.auth_password
 
     def resolved_priv_password(self, env: Mapping[str, str] | None = None) -> str:
@@ -286,6 +271,7 @@ class NetworkConfig(BaseModel):
     """
 
     icmp_targets: list[IcmpTarget] = Field(default_factory=list)
+
     snmp_targets: list[SnmpTarget] = Field(default_factory=list)
     icmp_interval_seconds: float = Field(default=5.0, gt=0.0)
     snmp_interval_seconds: float = Field(default=60.0, gt=0.0)
@@ -310,11 +296,9 @@ class DiagnosticConfig(BaseModel):
     gemini_model: str = "gemini-1.5-flash"
     gemini_api_key: str = Field(default="", description="Supports ${GEMINI_API_KEY} interpolation")
 
-    # Guardrails / FinOps
     cooldown_minutes: int = Field(default=15, ge=1)
     max_calls_per_hour: int = Field(default=10, ge=1)
 
-    # Evaluation
     evaluation_window_minutes: int = Field(default=10, ge=1)
     evaluation_interval_seconds: float = Field(default=60.0, ge=10.0)
     enabled_metric_sources: list[Literal["host", "caddy", "docker", "endpoint", "network"]] = Field(
@@ -322,15 +306,12 @@ class DiagnosticConfig(BaseModel):
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase 4 — multi-burn-rate SLO alerting
-# ---------------------------------------------------------------------------
-
-
 class SloSource(StrEnum):
     """Metric sources that expose a genuine good/bad event ratio.
 
     Only these two are offered. An SLI must be a ratio of successful events to
+
+
     total events; host CPU percentage and Docker event counts are not, and
     dividing one by an error budget produces a burn rate that means nothing.
     Restricting the enum makes config validation reject the mistake outright
@@ -348,6 +329,7 @@ class SloDefinition(BaseModel):
 
     name: str = Field(min_length=1, description="Unique identifier, used in the alert key")
     source: SloSource
+
     entity_id: str = Field(
         min_length=1,
         description="caddy: the instance_id; icmp: the target host",
@@ -386,8 +368,6 @@ class SmtpConfig(BaseModel):
     password: str = Field(default="", description="Supports ${SMTP_PASSWORD} interpolation")
     from_addr: str = ""
     to_addrs: list[str] = Field(default_factory=list)
-    # starttls (587) and implicit tls (465) are mutually exclusive; one field
-    # rather than two booleans makes an impossible combination unrepresentable.
     security: SmtpSecurity = SmtpSecurity.STARTTLS
 
     @property
@@ -409,7 +389,6 @@ class AlertingConfig(BaseModel):
     enabled: bool = True
     evaluation_interval_seconds: float = Field(default=60.0, ge=10.0)
 
-    # Suppression and flapping protection.
     cooldown_minutes: int = Field(default=15, ge=1, description="Minimum gap between notifications for one alert key")
     resolve_after_seconds: float = Field(
         default=300.0,
@@ -420,18 +399,14 @@ class AlertingConfig(BaseModel):
     request_timeout_seconds: float = Field(default=10.0, gt=0.0)
     slo_window_days: int = Field(default=30, ge=1, description="Error budget period")
 
-    # Fast burn: page-worthy. Short window is the canary that stops a brief
-    # spike from firing on the long window alone.
     fast_burn_budget_fraction: float = Field(default=0.02, gt=0.0, lt=1.0)
     fast_burn_long_window_minutes: int = Field(default=60, ge=1)
     fast_burn_short_window_minutes: int = Field(default=5, ge=1)
 
-    # Slow burn: ticket-worthy.
     slow_burn_budget_fraction: float = Field(default=0.05, gt=0.0, lt=1.0)
     slow_burn_long_window_minutes: int = Field(default=360, ge=1)
     slow_burn_short_window_minutes: int = Field(default=30, ge=1)
 
-    # Channels. All support ${ENV_VAR} interpolation; empty means unconfigured.
     discord_webhook_url: str = ""
     slack_webhook_url: str = ""
     smtp: SmtpConfig = Field(default_factory=SmtpConfig)
@@ -470,9 +445,6 @@ class ConfigManager(BaseModel):
         *,
         env: Mapping[str, str] | None = None,
     ) -> ConfigManager:
-        # Parse first, then interpolate the resulting scalars. Doing it in this
-        # order means an environment variable can never alter the structure of
-        # the config, only the value of a leaf that already exists.
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise TypeError(f"{path}: expected a mapping at the top level")

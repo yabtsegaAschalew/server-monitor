@@ -59,13 +59,13 @@ async def open_agent(config: ConfigManager) -> AsyncIterator[object]:
         await agent.start()
         try:
             yield agent
+
         finally:
-            # Agent first (releases the provider's HTTP pool), database second,
-            # so a late write still lands.
             await agent.aclose()
 
 
 def _require_api_key(config: ConfigManager) -> bool:
+
     from diagnostic.agent import resolve_api_key
 
     if resolve_api_key(config.diagnostic) is None:
@@ -81,6 +81,8 @@ def split_anomaly_type(anomaly: str) -> tuple[str, str]:
     """Split the agent's own ``"<metric_type>:<entity_id>"`` key.
 
     An entity id may itself contain a colon (an IPv6 ICMP target, say), so split
+
+
     once from the left only.
     """
     metric_type, sep, entity_id = anomaly.partition(":")
@@ -89,14 +91,10 @@ def split_anomaly_type(anomaly: str) -> tuple[str, str]:
     return metric_type, entity_id
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-
 async def run_daemon(config: ConfigManager, interval: float | None = None) -> None:
     if not _require_api_key(config):
         return
+
     async with open_agent(config) as agent:
         await agent.run_daemon(interval_seconds=interval)
 
@@ -123,6 +121,7 @@ async def run_analyze(
         return
     print(f"severity={plan.severity.value} root_cause={plan.root_cause}")
     print("proposed commands (model-generated, NOT executed — review before running):")
+
     for cmd in plan.suggested_commands:
         print(f"  proposed: {cmd}")
 
@@ -164,11 +163,6 @@ async def run_review(
         print(f"rule {rule_id} {status}")
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing, shared by both entry points
-# ---------------------------------------------------------------------------
-
-
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Attach the diagnostic subcommands to an existing parser."""
     sub = parser.add_subparsers(dest="diag_command", required=True)
@@ -178,11 +172,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     daemon.add_argument("--config", default="config.yaml", help="Path to YAML config")
 
     analyze = sub.add_parser("analyze", help="Run a single ad-hoc anomaly analysis")
-    # Either --anomaly "host:localhost" (the agent's own key format) or the
-    # explicit pair. One of the two is required.
     analyze.add_argument("--anomaly", default=None, help="Anomaly key, e.g. host:localhost")
     analyze.add_argument("--type", choices=[m.value for m in MetricType], dest="metric_type", default=None)
     analyze.add_argument("--entity", default=None)
+
     analyze.add_argument("--window", type=int, default=None, help="Evaluation window in minutes")
     analyze.add_argument("--config", default="config.yaml", help="Path to YAML config")
 
@@ -197,6 +190,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
     reject = sub.add_parser("reject", help="Mark a rule as rejected")
     reject.add_argument("rule_id", type=int)
+
     reject.add_argument("--user", default=None)
     reject.add_argument("--config", default="config.yaml", help="Path to YAML config")
 
@@ -212,11 +206,9 @@ def resolve_analyze_target(args: argparse.Namespace) -> tuple[str, str]:
 
 async def dispatch(args: argparse.Namespace, config: ConfigManager | None = None) -> None:
     """Route a parsed namespace to the matching command."""
+
     cfg = config if config is not None else ConfigManager.from_file(args.config)
 
-    # Read the flag directly rather than importing diagnostic.agent for it:
-    # that module pulls in langgraph and the Gemini SDK, which `list-rules` and
-    # `approve` have no use for.
     if not cfg.diagnostic.enabled:
         print("diagnostic module is disabled in config; cannot run diagnostic commands")
         return

@@ -23,9 +23,6 @@ DEFAULT_HOST_INTERVAL = 5.0
 DEFAULT_CADDY_INTERVAL = 15.0
 
 # SECURITY/portability: HOST_ROOT lets the monitor read the real machine's
-# filesystems when they are bind-mounted under a prefix (e.g. /host) in the
-# container. Defaults to / (read the container's own /proc) so behaviour is
-# unchanged outside a container. The disk-usage root follows the same prefix.
 _HOST_ROOT = os.environ.get("HOST_ROOT", "").rstrip("/")
 _PROC_ROOT = Path(f"{_HOST_ROOT}/proc") if _HOST_ROOT else Path("/proc")
 
@@ -45,10 +42,12 @@ _DEFAULT_READER: _ProcReader = _DefaultProcReader()
 
 
 def _read_proc_stat(reader: _ProcReader = _DEFAULT_READER) -> tuple[int, int]:
+
     text = reader.read_text(_PROC_ROOT / "stat")
     parts = text.split("\n")[0].split()
     fields = [int(f) for f in parts[1:]]
     idle = fields[3] if len(fields) > 3 else 0
+
     total = sum(fields)
     return idle, total
 
@@ -65,8 +64,12 @@ def _read_proc_meminfo(reader: _ProcReader = _DEFAULT_READER) -> float:
     total = info.get("MemTotal", 0)
     if total <= 0:
         return 0.0
-    free = info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0) + info.get("SReclaimable", 0)
-    return max(0.0, min(100.0, (1.0 - free / total) * 100.0))
+    available = info.get("MemAvailable")
+    if available is None:
+        available = (
+            info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0) + info.get("SReclaimable", 0)
+        )
+    return max(0.0, min(100.0, (1.0 - available / total) * 100.0))
 
 
 def _read_proc_diskstats(reader: _ProcReader = _DEFAULT_READER) -> tuple[int, int]:
@@ -81,11 +84,19 @@ def _read_proc_diskstats(reader: _ProcReader = _DEFAULT_READER) -> tuple[int, in
         if not name.startswith(("sd", "vd", "nvme", "dm-")):
             continue
         total_read_bytes += int(parts[5]) * 512
+
         total_write_bytes += int(parts[9]) * 512
     return total_read_bytes, total_write_bytes
 
 
-def _read_proc_net_dev(reader: _ProcReader = _DEFAULT_READER) -> tuple[int, int]:
+_DEFAULT_NET_EXCLUDES = ("lo", "docker0", "veth", "br-", "virbr")
+
+
+def _read_proc_net_dev(
+    reader: _ProcReader = _DEFAULT_READER,
+    *,
+    exclude: tuple[str, ...] = _DEFAULT_NET_EXCLUDES,
+) -> tuple[int, int]:
     text = reader.read_text(_PROC_ROOT / "net" / "dev")
     total_recv = 0
     total_sent = 0
@@ -93,9 +104,14 @@ def _read_proc_net_dev(reader: _ProcReader = _DEFAULT_READER) -> tuple[int, int]
         line = line.strip()
         if not line or line.startswith(("Inter", "face")):
             continue
+
+        ifname = line.split(":", 1)[0].strip()
+        if any(_prefix in ifname for _prefix in exclude):
+            continue
         parts = line.split()
         if len(parts) >= 10:
             total_recv += int(parts[1])
+
             total_sent += int(parts[9])
     return total_sent, total_recv
 
@@ -106,15 +122,18 @@ def _read_proc_loadavg(reader: _ProcReader = _DEFAULT_READER) -> float:
 
 
 def _read_proc_pressure(reader: _ProcReader = _DEFAULT_READER) -> tuple[float | None, float | None, float | None]:
+
     def _read_one(name: str) -> float | None:
         try:
             text = reader.read_text(_PROC_ROOT / "pressure" / name)
+
         except (FileNotFoundError, ValueError, IndexError, OSError):
             return None
         else:
             for line in text.splitlines():
                 if line.startswith("some"):
                     parts = line.split()
+
                     for part in parts:
                         if part.startswith("avg10="):
                             return float(part.split("=", 1)[1])
@@ -141,7 +160,12 @@ class HostMetricsCollector:
         reader: _ProcReader | None = None,
     ) -> None:
         self._host_id = host_id
-        self._disk_path = disk_path if disk_path is not None else (_HOST_ROOT or "/")
+        if disk_path is not None:
+            self._disk_path = disk_path
+        elif _HOST_ROOT:
+            self._disk_path = f"{_HOST_ROOT}/root"
+        else:
+            self._disk_path = "/"
         self._reader = reader or _DEFAULT_READER
         self._snapshot: _CounterSnapshot | None = None
         self._prev_idle, self._prev_total = _read_proc_stat(self._reader)
@@ -198,6 +222,7 @@ class HostMetricsCollector:
         )
 
     async def collect(self) -> HostMetric:
+
         return await asyncio.to_thread(self.collect_sync)
 
 
@@ -231,7 +256,8 @@ class SystemHealthDaemon:
         self.host_interval = host_interval
         self.caddy_interval = caddy_interval
         self.missed_scrape = 0
-        self._host = HostMetricsCollector((host or HostConfig()).host_id)
+        host_cfg = host or HostConfig()
+        self._host = HostMetricsCollector(host_cfg.host_id, disk_path=host_cfg.disk_path)
         self._caddy = CaddyScraper(caddy or CaddyConfig(), client=client)
         self._sleeper = sleeper
         self._stop_event: asyncio.Event | None = None
@@ -288,8 +314,6 @@ class SystemHealthDaemon:
     async def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
-        # Both loops spend most of their time inside a sleep of up to
-        # caddy_interval; the flag alone would make shutdown wait that out.
         for task in self._tasks:
             if not task.done():
                 task.cancel()
@@ -299,7 +323,6 @@ class SystemHealthDaemon:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks = []
-        # Close the HTTP client only once the caddy loop has actually stopped.
         await self._caddy.aclose()
 
     async def __aenter__(self) -> SystemHealthDaemon:

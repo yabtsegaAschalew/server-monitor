@@ -14,11 +14,6 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    # NOTE: do not add a "cli" branch here. `from diagnostic import cli` inside
-    # this function would re-enter __getattr__ and recurse forever. The import
-    # machinery already resolves `from diagnostic import cli` and
-    # `from diagnostic.cli import ...` on its own, which is all the entry points
-    # need; this hook exists only for the eager re-exports below.
     if name == "DiagnosticAgent":
         from diagnostic.agent import DiagnosticAgent
 

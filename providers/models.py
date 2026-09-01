@@ -4,9 +4,6 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# A proposed remediation command is a short shell one-liner. Anything longer is
-# either a runaway generation or a payload smuggled through an
-# attacker-influenced telemetry field.
 MAX_COMMAND_LENGTH = 500
 
 
@@ -23,6 +20,7 @@ class TokenUsage(BaseModel):
     model_config = ConfigDict(slots=True, frozen=True)
 
     prompt_tokens: int = Field(ge=0)
+
     completion_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
 

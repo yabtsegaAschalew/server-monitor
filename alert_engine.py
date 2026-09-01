@@ -47,11 +47,6 @@ BurnClass = Literal["fast", "slow"]
 AlertStatus = Literal["firing", "resolved"]
 
 
-# ---------------------------------------------------------------------------
-# Burn-rate arithmetic
-# ---------------------------------------------------------------------------
-
-
 def burn_rate_threshold(
     budget_fraction: float,
     window_hours: float,
@@ -83,6 +78,7 @@ def burn_rate(failure_ratio: float, error_budget: float) -> float:
 def budget_consumed_pct(rate: float, window_hours: float, slo_window_days: int = 30) -> float:
     """Percentage of the error budget spent over `window_hours` at this burn rate.
 
+
     Inverse of `burn_rate_threshold`: at 14.4x over one hour of a 30-day budget
     this returns 2.0, which is the statement the threshold was defined by.
     """
@@ -97,12 +93,11 @@ class BurnWindow:
     threshold: float
     long_window_minutes: int
     short_window_minutes: int
+
     budget_fraction: float
 
     @property
     def severity(self) -> Severity:
-        # Fast burn exhausts the budget within hours and warrants waking someone;
-        # slow burn is a ticket.
         return Severity.CRITICAL if self.burn_class == "fast" else Severity.HIGH
 
 
@@ -132,11 +127,6 @@ def build_burn_windows(config: AlertingConfig) -> tuple[BurnWindow, ...]:
             budget_fraction=config.slow_burn_budget_fraction,
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# Alert payload
-# ---------------------------------------------------------------------------
 
 
 class AlertPayload(BaseModel):
@@ -185,11 +175,6 @@ class AlertPayload(BaseModel):
         )
 
 
-# ---------------------------------------------------------------------------
-# SLI evaluation
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class SliSample:
     """A failure ratio plus the event volume it was computed from."""
@@ -214,8 +199,6 @@ class SloEvaluator:
         if slo.source == SloSource.CADDY:
             weighted, volume = await self._db.caddy_sli_window(slo.entity_id, minutes=minutes)
             if volume <= 0.0:
-                # No traffic is not a failure. Returning 0.0 here is the
-                # difference between a quiet night and a phantom page.
                 return SliSample(failure_ratio=0.0, volume=0.0)
             return SliSample(failure_ratio=max(0.0, min(1.0, weighted / volume)), volume=volume)
 
@@ -231,11 +214,6 @@ class SloEvaluator:
         raise ValueError(f"unsupported SLO source: {slo.source!r}")
 
 
-# ---------------------------------------------------------------------------
-# Dispatchers
-# ---------------------------------------------------------------------------
-
-
 class AlertDispatcher(ABC):
     """A notification channel.
 
@@ -244,8 +222,6 @@ class AlertDispatcher(ABC):
     stop the others or kill the evaluation loop.
     """
 
-    # Empty slots on the base so subclass __slots__ actually take effect;
-    # without this every dispatcher would still carry a __dict__.
     __slots__ = ()
 
     @property
@@ -294,8 +270,6 @@ class _WebhookDispatcher(AlertDispatcher):
             logger.error("%s dispatch failed: %s", self.name, exc)
             return False
         if response.status_code >= 400:
-            # Never log the response body verbatim: a webhook error can echo the
-            # URL, and the URL is the credential.
             logger.error("%s dispatch rejected with status %d", self.name, response.status_code)
             return False
         return True
@@ -407,8 +381,6 @@ class SmtpDispatcher(AlertDispatcher):
         if self._template is None:
             from jinja2 import Template
 
-            # autoescape matters: entity_id can carry an attacker-influenced
-            # container name, and this renders into HTML.
             self._template = Template(_EMAIL_TEMPLATE, autoescape=True)
         return self._template.render(
             title=payload.title,
@@ -436,6 +408,7 @@ class SmtpDispatcher(AlertDispatcher):
         message["To"] = ", ".join(cfg.to_addrs)
         message["Subject"] = payload.title
         message.set_content(payload.summary)
+
         message.add_alternative(self._render(payload), subtype="html")
 
         try:
@@ -469,7 +442,11 @@ def build_dispatchers(
 
     Returns the dispatchers plus the HTTP client that owns their connection pool
     (None when no webhook channel is configured), so the caller can close it in
+
+
     the right order during shutdown.
+
+
     """
     dispatchers: list[AlertDispatcher] = []
     owned_client: httpx.AsyncClient | None = None
@@ -489,11 +466,6 @@ def build_dispatchers(
         dispatchers.append(SmtpDispatcher(config.smtp, config.request_timeout_seconds))
 
     return dispatchers, owned_client
-
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -557,8 +529,6 @@ class AlertEngine:
     def dispatchers(self) -> list[AlertDispatcher]:
         return self._dispatchers
 
-    # -- evaluation ----------------------------------------------------
-
     @staticmethod
     def alert_key(slo_name: str, burn_class: str) -> str:
         return f"{slo_name}:{burn_class}"
@@ -583,8 +553,6 @@ class AlertEngine:
             return None
         short_burn = burn_rate(short_sample.failure_ratio, slo.error_budget)
         if short_burn < window.threshold:
-            # Long window is still elevated by an incident that has since
-            # stopped. Not currently burning.
             return None
 
         return AlertPayload(
@@ -608,22 +576,16 @@ class AlertEngine:
             triggered_at=datetime.now(UTC),
         )
 
-    # -- dispatch ------------------------------------------------------
-
     async def dispatch(self, payload: AlertPayload) -> bool:
         """Send to every configured channel. True if any succeeded."""
         if not self._dispatchers:
             if not self._missing_channel_logged:
-                # The explanation is logged once, not once per alert: a
-                # misconfigured deployment should not drown its own log.
                 logger.error(
                     "alerting is enabled but no notification channel is configured; "
                     "alerts are being recorded in active_alerts but not sent. Set "
                     "alerting.discord_webhook_url, alerting.slack_webhook_url, or alerting.smtp."
                 )
                 self._missing_channel_logged = True
-            # The alert itself IS logged every time — with no channel, the log
-            # is the only place it can surface at all.
             logger.warning("ALERT %s", format_alert_line(payload))
             return False
 
@@ -638,8 +600,6 @@ class AlertEngine:
             elif result:
                 delivered = True
         return delivered
-
-    # -- state machine -------------------------------------------------
 
     async def _handle_firing(self, payload: AlertPayload) -> None:
         key = payload.alert_key
@@ -682,9 +642,6 @@ class AlertEngine:
             self._pending_resolve.pop(key, None)
             return
 
-        # Flapping protection: hold the alert open until it has been quiet long
-        # enough, so a metric sitting on the threshold does not emit a
-        # fire/resolve pair on every tick.
         pending = self._pending_resolve.get(key)
         if pending is None:
             self._pending_resolve[key] = _PendingResolve(since=now)
@@ -738,8 +695,6 @@ class AlertEngine:
                     logger.exception("failed to record alert state for %s", slo.name)
         return fired
 
-    # -- lifecycle -----------------------------------------------------
-
     async def run_forever(self) -> None:
         self._stop_event = asyncio.Event()
         if not self._config.slos:
@@ -759,6 +714,7 @@ class AlertEngine:
                 raise
             except Exception:
                 logger.exception("alert evaluation cycle failed")
+
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
@@ -778,8 +734,6 @@ class AlertEngine:
                 await dispatcher.aclose()
             except Exception:  # noqa: BLE001 - shutdown must not raise
                 logger.debug("error closing %s dispatcher", dispatcher.name, exc_info=True)
-        # Closed last, and only if we created it: closing a caller-supplied
-        # client would break the caller.
         if self._owned_client is not None:
             await self._owned_client.aclose()
             self._owned_client = None

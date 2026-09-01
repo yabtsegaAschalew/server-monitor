@@ -12,8 +12,6 @@ from providers.models import MAX_COMMAND_LENGTH, ActionPlan, Severity
 
 logger = logging.getLogger(__name__)
 
-# No call may outlive this. Without it a hung connection stalls the entity scan,
-# which stalls the daemon loop, indefinitely and without a log line.
 LLM_TIMEOUT_SECONDS = 30.0
 
 _SYSTEM_PROMPT = """\
@@ -114,9 +112,6 @@ class GeminiProvider(AIProvider):
     async def analyze_incident(self, telemetry_data: dict) -> ActionPlan:
         prompt = self._build_prompt(telemetry_data)
 
-        # Clear stale usage up front: if this call fails before reporting
-        # metadata, the previous call's token counts must not be attributed
-        # to it.
         self._last_usage = None
 
         try:
@@ -149,13 +144,10 @@ class GeminiProvider(AIProvider):
         if not response.text:
             raise ValueError("Gemini returned empty response")
 
-        # The real validation boundary: whatever the model returned must satisfy
-        # ActionPlan, including the command bounds and the approval flag.
         plan = ActionPlan.model_validate_json(response.text)
         if not plan.requires_human_approval:
             raise ValueError("ActionPlan requires_human_approval must be True")
 
-        # Capture token usage metadata for FinOps logging.
         if response.usage_metadata is not None:
             self._last_usage = response.usage_metadata
 
@@ -187,10 +179,7 @@ class GeminiProvider(AIProvider):
 
     @staticmethod
     def _build_prompt(telemetry_data: dict) -> str:
-        # XML-style delimiters rather than a markdown fence: the sanitizer
-        # rewrites backticks, but a fence is still the weaker boundary, and
         # <telemetry> pairs with the explicit untrusted-data brief in the
-        # system prompt.
         payload = json.dumps(telemetry_data, indent=2, default=str)
         return (
             "Analyze the following server telemetry and identify the root cause "

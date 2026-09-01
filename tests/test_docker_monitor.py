@@ -37,6 +37,7 @@ class FakeSleeper:
         self.calls: list[float] = []
 
     async def __call__(self, seconds: float) -> None:
+
         self.calls.append(seconds)
         await asyncio.sleep(0)
 
@@ -50,6 +51,7 @@ class BytesStream(httpx.AsyncByteStream):
             yield chunk
 
     async def aclose(self) -> None:
+
         pass
 
 
@@ -60,6 +62,7 @@ async def wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> 
 
 
 def stream_response(lines: list[str]) -> httpx.Response:
+
     payload = "\n".join(lines).encode("utf-8")
     return httpx.Response(200, stream=BytesStream([payload]))
 
@@ -68,9 +71,6 @@ def one_shot_stream(*lines: str) -> httpx.Response:
     return stream_response(list(lines))
 
 
-# Docker container IDs are hex (64 chars, 12-char short form). parse_event
-# validates the format before the value can reach the database and, later, a
-# request path — so fixtures must use a realistic ID.
 CONTAINER_ID = "a1b2c3d4e5f6"
 
 
@@ -85,6 +85,7 @@ def docker_event(
     attributes: dict[str, str] = {"name": name, "image": image}
     if exit_code is not None:
         attributes["exitCode"] = str(exit_code)
+
     if signal is not None:
         attributes["signal"] = str(signal)
     return {
@@ -107,31 +108,38 @@ def make_monitor(**config_kwargs) -> DockerMonitor:
 
 
 def test_parse_die_event() -> None:
+
     event = parse_event(docker_event("die", exit_code=137, signal=9))
 
     assert event is not None
     assert event.container_id == CONTAINER_ID
+
     assert event.container_name == "web-01"
     assert event.status == "die"
     assert event.image == "nginx:latest"
+
     assert event.exit_code == 137
     assert event.failure_reason == "exited with code 137 (signal 9)"
 
 
 def test_parse_oom_event() -> None:
     event = parse_event(docker_event("oom", exit_code=137))
+
     assert event is not None
+
     assert event.failure_reason == "out of memory"
 
 
 def test_parse_kill_event() -> None:
     event = parse_event(docker_event("kill", signal=9))
+
     assert event is not None
     assert event.failure_reason == "killed by signal 9"
 
 
 def test_parse_pause_event() -> None:
     event = parse_event(docker_event("pause"))
+
     assert event is not None
     assert event.status == "pause"
     assert event.failure_reason is None
@@ -139,7 +147,9 @@ def test_parse_pause_event() -> None:
 
 def test_parse_restart_event() -> None:
     event = parse_event(docker_event("restart"))
+
     assert event is not None
+
     assert event.failure_reason == "container restarted"
 
 
@@ -160,6 +170,7 @@ def test_parse_network_disconnect_returns_none() -> None:
 def test_parse_missing_container_id_returns_none() -> None:
     payload = docker_event("die")
     payload["id"] = None
+
     payload["Actor"]["ID"] = None
     assert parse_event(payload) is None
 
@@ -167,11 +178,11 @@ def test_parse_missing_container_id_returns_none() -> None:
 @pytest.mark.parametrize(
     "bad_id",
     [
-        "../../v1.41/containers/other",  # path traversal
-        "abc123?stream=true",  # query-string injection
-        "c1",  # too short to be a container ID
-        "z" * 12,  # not hex
-        "a1b2c3d4e5f6/exec",  # extra path segment
+        "../../v1.41/containers/other",
+        "abc123?stream=true",
+        "c1",
+        "z" * 12,
+        "a1b2c3d4e5f6/exec",
     ],
 )
 def test_parse_event_rejects_malformed_container_id(bad_id: str) -> None:
@@ -179,14 +190,18 @@ def test_parse_event_rejects_malformed_container_id(bad_id: str) -> None:
 
     get_container_stats() interpolates the stored ID into a Docker API path, so
     anything that is not plain hex is a path-manipulation vector.
+
+
     """
     payload = docker_event("die")
     payload["id"] = bad_id
+
     payload["Actor"]["ID"] = bad_id
     assert parse_event(payload) is None
 
 
 def test_sliding_window_flags_after_max_events() -> None:
+
     clock = FakeClock()
     detector = CrashLoopDetector(now=clock)
 
@@ -235,6 +250,7 @@ async def test_monitor_streams_events_and_flags_crash_loop(respx_mock) -> None:
     first = {"used": False}
 
     def handler(request) -> httpx.Response:
+
         if not first["used"]:
             first["used"] = True
             return stream_response(lines)
@@ -251,10 +267,12 @@ async def test_monitor_streams_events_and_flags_crash_loop(respx_mock) -> None:
     await monitor.aclose()
 
     events = [i for i in items if isinstance(i, DockerEvent)]
+
     crashes = [i for i in items if isinstance(i, CrashLoopEvent)]
     assert len(events) == 4
     assert len(crashes) == 1
     assert crashes[0].container_id == CONTAINER_ID
+
     assert crashes[0].container_name == "web-01"
     assert crashes[0].event_count == 4
 
@@ -274,9 +292,9 @@ async def test_monitor_backoff_doubles_with_jitter(respx_mock) -> None:
     await task
     await monitor.aclose()
 
-    # Without jitter: exact doubling 1, 2, 4, 8, 16, 30, 30, 30
     assert sleeper.calls[:5] == [1.0, 2.0, 4.0, 8.0, 16.0]
-    assert sleeper.calls[5] == 30.0  # capped at backoff_max_seconds
+
+    assert sleeper.calls[5] == 30.0
     assert all(call == 30.0 for call in sleeper.calls[5:])
     assert monitor.reconnects == len(sleeper.calls)
 
@@ -291,18 +309,18 @@ async def test_monitor_backoff_includes_jitter(respx_mock) -> None:
     )
 
     task = asyncio.create_task(monitor.run_forever(lambda item: None))
+
     await wait_until(lambda: len(sleeper.calls) >= 3)
     await monitor.stop()
     await task
     await monitor.aclose()
 
-    # With 25% jitter, first sleep should be in [1.0, 1.25]
     assert 1.0 <= sleeper.calls[0] <= 1.25
-    # Second sleep should be in [2.0, 2.5]
     assert 2.0 <= sleeper.calls[1] <= 2.5
 
 
 async def test_monitor_backoff_resets_after_successful_events(respx_mock) -> None:
+
     calls = {"count": 0}
 
     def handler(request) -> httpx.Response:
@@ -321,6 +339,7 @@ async def test_monitor_backoff_resets_after_successful_events(respx_mock) -> Non
 
     task = asyncio.create_task(monitor.run_forever(lambda item: None))
     await wait_until(lambda: len(sleeper.calls) >= 3)
+
     await monitor.stop()
     await task
     await monitor.aclose()
@@ -330,6 +349,7 @@ async def test_monitor_backoff_resets_after_successful_events(respx_mock) -> Non
 
 async def test_monitor_gives_up_after_max_attempts(respx_mock) -> None:
     respx_mock.get(EVENTS_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+
     sleeper = FakeSleeper()
     monitor = DockerMonitor(
         DockerConfig(base_url=BASE_URL, max_attempts=3, backoff_jitter_ratio=0.0),
@@ -342,6 +362,7 @@ async def test_monitor_gives_up_after_max_attempts(respx_mock) -> None:
     await monitor.aclose()
 
     assert monitor.reconnects == 3
+
     assert sleeper.calls == [1.0, 2.0, 4.0]
 
 
@@ -370,6 +391,7 @@ async def test_monitor_skips_malformed_line_and_continues(respx_mock) -> None:
 
 
 async def test_monitor_http_error_raises_stream_error(respx_mock) -> None:
+
     respx_mock.get(EVENTS_URL).mock(return_value=httpx.Response(500, text="boom"))
 
     monitor = make_monitor()
@@ -383,7 +405,9 @@ async def test_monitor_stop_and_aclose_are_clean(respx_mock) -> None:
     monitor = make_monitor()
 
     task = asyncio.create_task(monitor.run_forever(lambda item: None))
+
     await asyncio.sleep(0.02)
+
     await monitor.stop()
     await task
     await monitor.aclose()
@@ -435,6 +459,7 @@ async def test_from_config_env_override_events_url_backward_compat(monkeypatch) 
 
 
 async def test_from_config_env_override_socket_path(monkeypatch) -> None:
+
     config = ConfigManager(
         polling={"interval_seconds": 5.0},
         thresholds={},
@@ -448,6 +473,129 @@ async def test_from_config_env_override_socket_path(monkeypatch) -> None:
         assert monitor._config.socket_path == "/var/run/docker.sock"
     finally:
         await monitor.aclose()
+
+
+async def test_consume_stream_appends_since_to_url(respx_mock) -> None:
+    requested_ids: list[str] = []
+    event = json.dumps(docker_event("die", exit_code=1))
+
+    def handler(request) -> httpx.Response:
+        requested_ids.append(str(request.url))
+        return stream_response([event])
+
+    respx_mock.get(url__regex=r".*/events.*").mock(side_effect=handler)
+    monitor = make_monitor()
+    items: list[object] = []
+
+    await monitor._consume_stream(items.append, since=1_620_000_123)
+
+    await monitor.aclose()
+
+    assert len(items) == 1
+    assert requested_ids, "expected at least one request"
+    assert "since=1620000123" in requested_ids[0]
+    assert monitor._last_event_time is not None
+
+
+async def test_consume_stream_without_since_omits_param(respx_mock) -> None:
+    requested_ids: list[str] = []
+    event = json.dumps(docker_event("die", exit_code=1))
+
+    def handler(request) -> httpx.Response:
+        requested_ids.append(str(request.url))
+        return stream_response([event])
+
+    respx_mock.get(url__regex=r".*/events.*").mock(side_effect=handler)
+    monitor = make_monitor()
+    items: list[object] = []
+
+    await monitor._consume_stream(items.append)
+    await monitor.aclose()
+
+    assert len(items) == 1
+    assert requested_ids, "expected at least one request"
+    assert "since=" not in requested_ids[0]
+
+
+async def test_consume_stream_tracks_opened_at(respx_mock) -> None:
+    clock = FakeClock()
+    respx_mock.get(EVENTS_URL).mock(return_value=stream_response([json.dumps(docker_event("die", exit_code=1))]))
+    monitor = DockerMonitor(DockerConfig(base_url=BASE_URL), now=clock)
+    try:
+        await monitor._consume_stream(lambda item: None)
+        assert monitor._stream_opened_at == clock()
+
+        assert monitor._last_event_time == clock()
+    finally:
+        await monitor.aclose()
+
+
+async def test_event_loop_catches_up_after_disconnect(respx_mock) -> None:
+    """After a disconnect, the next connect must request events since the last
+    known event time, so nothing that happened during the outage is lost."""
+    captured: list[float | None] = []
+    calls = {"count": 0}
+
+    def handler(request) -> httpx.Response:
+        captured.append(request.url.params.get("since"))
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return stream_response([json.dumps(docker_event("die", exit_code=1))])
+
+        raise httpx.ConnectError("connection refused")
+
+    respx_mock.get(url__regex=r".*/events.*").mock(side_effect=handler)
+    sleeper = FakeSleeper()
+    clock = FakeClock()
+    monitor = DockerMonitor(
+        DockerConfig(base_url=BASE_URL, backoff_jitter_ratio=0.0),
+        sleeper=sleeper,
+        now=clock,
+    )
+
+    task = asyncio.create_task(monitor.run_forever(lambda item: None))
+    await wait_until(lambda: len(captured) >= 2)
+
+    await monitor.stop()
+    await task
+    await monitor.aclose()
+
+    assert captured[0] is None
+    assert captured[1] == str(int(clock()))
+
+
+async def test_event_loop_catches_up_after_each_successful_cycle(respx_mock) -> None:
+    """A graceful close with events must not blind the next reconnect: it should
+    still request events since the last known event time."""
+    captured: list[float | None] = []
+
+    calls = {"count": 0}
+
+    def handler(request) -> httpx.Response:
+        captured.append(request.url.params.get("since"))
+        calls["count"] += 1
+        if calls["count"] < 3:
+            return stream_response([json.dumps(docker_event("die", exit_code=1))])
+        raise httpx.ConnectError("connection refused")
+
+    respx_mock.get(url__regex=r".*/events.*").mock(side_effect=handler)
+    sleeper = FakeSleeper()
+    clock = FakeClock()
+    monitor = DockerMonitor(
+        DockerConfig(base_url=BASE_URL, backoff_jitter_ratio=0.0),
+        sleeper=sleeper,
+        now=clock,
+    )
+
+    task = asyncio.create_task(monitor.run_forever(lambda item: None))
+    await wait_until(lambda: len(captured) >= 3)
+    await monitor.stop()
+    await task
+    await monitor.aclose()
+
+    assert captured[0] is None
+    assert captured[1] is not None
+    assert captured[2] is not None
 
 
 def test_build_event_url_tcp_proxy() -> None:

@@ -18,7 +18,6 @@ import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# Attribute chains and bare names that can start a process or evaluate code.
 _FORBIDDEN_CALLS = {
     "os.system",
     "os.popen",
@@ -43,8 +42,6 @@ _FORBIDDEN_CALLS = {
 
 _FORBIDDEN_IMPORTS = {"subprocess", "shlex", "pty", "commands", "pickle", "marshal"}
 
-# The guarantee covers shipped code. Tests may name these constructs in order to
-# assert their absence.
 _EXEMPT = {"tests/test_execution_boundary.py"}
 
 
@@ -135,18 +132,13 @@ def test_proposed_rules_have_no_consumer() -> None:
     import database
 
     source = pathlib.Path(database.__file__).read_text(encoding="utf-8")
-    # The only writes to rule status come from the explicit CLI review path.
     assert "def update_rule_status" in source
     assert "def query_proposed_rules" in source
 
-    # database.py defines the API. main.py and diagnostic/cli.py are the
-    # sanctioned human review path — cli.py holds the implementation shared by
-    # `python -m main diagnostic ...` and `python -m diagnostic ...`, and it
-    # only ever updates a status column. Tests legitimately read the table to
-    # assert on it. The concern is shipped code that *acts* on a rule.
     _REVIEW_PATH = {"database.py", "main.py", "diagnostic/cli.py"}
 
     callers: list[str] = []
+
     for path in _python_sources():
         rel = str(path.relative_to(_REPO_ROOT))
         if rel in _REVIEW_PATH or rel.startswith("tests/"):
@@ -163,8 +155,11 @@ def test_review_path_never_executes_a_suggested_command() -> None:
     `approve` is the single most dangerous-sounding verb in this system. This
     asserts that the module implementing it contains no execution primitive and
     never reads the command text out of a plan in order to run it.
+
+
     """
     cli = _REPO_ROOT / "diagnostic" / "cli.py"
+
     tree = ast.parse(cli.read_text(encoding="utf-8"), filename=str(cli))
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -181,7 +176,5 @@ def test_review_path_never_executes_a_suggested_command() -> None:
 def test_detector_actually_detects(snippet: str) -> None:
     """Guard against the guard silently matching nothing."""
     tree = ast.parse(snippet)
-    found = [
-        _dotted_name(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)
-    ]
+    found = [_dotted_name(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)]
     assert any(name in _FORBIDDEN_CALLS for name in found)
