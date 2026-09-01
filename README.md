@@ -2,9 +2,9 @@
 
 An asynchronous, low-overhead server monitoring system built with Python 3.12+ and `asyncio`. Collects host metrics, Caddy reverse-proxy telemetry, Docker container events, and network probes (ICMP/SNMP), then persists everything to SQLite via a single-writer queue architecture.
 
-Phase 3 adds a **central diagnostic agent** — a LangGraph orchestrator that detects threshold breaches, invokes a pluggable LLM provider (Gemini by default) for root-cause analysis, and produces human-approved remediation proposals without ever executing commands automatically.
+Includes a **central diagnostic agent** — a LangGraph orchestrator that detects threshold breaches, invokes a pluggable LLM provider (Gemini by default) for root-cause analysis, and produces human-approved remediation proposals without ever executing commands automatically.
 
-Phase 4 adds **multi-burn-rate SLO alerting** — a fast + slow burn-rate pair with a short canary window, plus Discord / Slack / SMTP notification dispatchers.
+Includes **multi-burn-rate SLO alerting** — a fast + slow burn-rate pair with a short canary window, plus Discord / Slack / SMTP notification dispatchers.
 
 ## Architecture
 
@@ -33,7 +33,7 @@ Phase 4 adds **multi-burn-rate SLO alerting** — a fast + slow burn-rate pair w
               └──────────────────────────────────┘
 ```
 
-### Phase 3 — Central Diagnostic Agent
+### Central Diagnostic Agent
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -64,7 +64,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | **WAL mode** | `PRAGMA journal_mode=WAL` enables concurrent reads while the writer holds the lock |
 | **Memory bounded** | Bounded `asyncio.Queue(maxsize=1000)` + batched `executemany` flushes (default batch=256). SLI aggregation for alerting runs as `SUM()` in SQL, so a 6-hour burn window costs the same memory as a 5-minute one |
 | **Queue overflow** | Drop with warning — telemetry is lossy by nature, no backpressure to collector daemons |
-| **Data retention** | Background `_PruneWorker` deletes rows older than 7 days across all5 tables |
+| **Data retention** | Background `_PruneWorker` deletes rows older than 7 days across all tables |
 | **CPU overhead** | No `psutil` — host metrics read directly from `/proc` (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/loadavg`, `/proc/pressure/*`) |
 | **Metric streaming** | Caddy scraper uses `httpx.stream()` with a cardinality filter — only parses the 3 known metric families, discards everything else in-stream |
 | **Provider abstraction** | `AIProvider` adapter interface — swap LLM providers via config (`diagnostic.provider`) with no orchestration changes |
@@ -81,7 +81,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | `config.py` | Pydantic configuration models with YAML loading and env-var interpolation |
 | `models.py` | Pydantic metric models (`HostMetric`, `CaddyMetric`, `DockerEvent`, etc.) |
 | `database.py` | Single-writer persistence engine — `DatabaseEngine` with queue ingest, batched writes, pruning, and query methods |
-| `alert_engine.py` | Phase 4 multi-burn-rate SLO evaluation, alert state machine, and notification dispatchers |
+| `alert_engine.py` | Multi-burn-rate SLO evaluation, alert state machine, and notification dispatchers |
 | `collectors/` | Collector daemon package |
 | `collectors/system_health.py` | Host telemetry from `/proc` + Caddy scrape orchestrator |
 | `collectors/caddy_scraper.py` | Streaming Prometheus scraper with cardinality filtering |
@@ -89,7 +89,7 @@ The provider is a pluggable adapter (`AIProvider`). Only `GeminiProvider` ships 
 | `providers/` | Pluggable AI provider adapters (vendor-lock-in avoidance) |
 | `providers/base.py` | `AIProvider` abstract interface |
 | `providers/gemini.py` | `GeminiProvider` — Google GenAI SDK implementation |
-| `diagnostic/` | Phase 3 central diagnostic agent (LangGraph) |
+| `diagnostic/` | Central diagnostic agent (LangGraph) |
 | `diagnostic/agent.py` | `DiagnosticAgent` — daemon + CLI wrapper around the compiled graph |
 | `diagnostic/nodes.py` | Three graph nodes: evaluate_metrics, run_diagnostics, human_in_the_loop |
 | `diagnostic/guardrails.py` | Cooldown, rate limiting, and token-usage tracking |
@@ -173,11 +173,11 @@ Environment variables are interpolated into `config.yaml` messages like `${VAR}`
 
 | Variable | Purpose | Required |
 |----------|---------|----------|
-| `GEMINI_API_KEY` | Google Gemini key for the Phase 3 diagnostic agent | Only if using the diagnostic module |
+| `GEMINI_API_KEY` | Google Gemini key for the diagnostic agent | Only if using the diagnostic module |
 | `SNMP_AUTH_PASSWORD` | SNMPv3 auth password (`auth_password`) | If SNMP auth enabled |
 | `SNMP_PRIV_PASSWORD` | SNMPv3 priv password (`priv_password`) | If SNMP priv enabled |
-| `DISCORD_WEBHOOK_URL` | Discord webhook for Phase 4 alert dispatch | If alerting to Discord |
-| `SLACK_WEBHOOK_URL` | Slack webhook for Phase 4 alert dispatch | If alerting to Slack |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for alert dispatch | If alerting to Discord |
+| `SLACK_WEBHOOK_URL` | Slack webhook for alert dispatch | If alerting to Slack |
 | `SMTP_HOST` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_FROM` | SMTP relay settings for email fallback (all four needed, plus `alerting.smtp.to_addrs` in `config.yaml`) | If alerting by email |
 | `MONITOR_DB_PATH` | SQLite database path (the container image sets this to `/data`); also settable via `collectors.database.db_path` | Only for overriding the default (`monitoring.db`) |
 | `DOCKER_BASE_URL` | Docker API base URL (default `http://docker-socket-proxy:2375`) | Only if overriding the default transport |
@@ -194,9 +194,6 @@ Example `config.yaml` for the collectors:
 polling:
   interval_seconds: 5.0
 
-# Field names are DATABASE COLUMN names, because breaches are evaluated against
-# rows read back out of SQLite. An empty mapping means no breach can ever be
-# detected, and the diagnostic agent will never have anything to analyse.
 thresholds:
   host:
     cpu:
@@ -245,7 +242,7 @@ collectors:
 
 #### Diagnostic agent configuration
 
-The Phase 3 diagnostic agent is configured under the top-level `diagnostic` block:
+The diagnostic agent is configured under the top-level `diagnostic` block:
 
 ```yaml
 diagnostic:
@@ -309,7 +306,7 @@ thresholds:
 
 ### Run
 
-The CLI is organised into subcommands. The legacy collector entry point is now `collectors`:
+The CLI is organised into subcommands:
 
 ```bash
 # Run the telemetry collectors (host + caddy + docker + network)
@@ -443,7 +440,7 @@ server-monitor/
 │   ├── base.py              # AIProvider abstract interface (adapter)
 │   ├── gemini.py            # GeminiProvider (Google GenAI SDK)
 │   └── models.py            # ActionPlan, Severity, TokenUsage (Pydantic)
-├── alert_engine.py          # Phase 4 burn-rate evaluation + dispatchers
+├── alert_engine.py          # Burn-rate evaluation + dispatchers
 ├── diagnostic/
 │   ├── __init__.py          # Lazy package exports
 │   ├── __main__.py          # `python -m diagnostic` entry point
@@ -471,7 +468,7 @@ server-monitor/
     └── test_execution_boundary.py   # asserts the no-execution guarantee
 ```
 
-## Phase 4 — Multi-Burn-Rate Alerting
+## Multi-Burn-Rate Alerting
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
