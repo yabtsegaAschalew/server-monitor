@@ -1,7 +1,7 @@
 [project]
 name = "server-monitor"
 version = "0.1.0"
-description = "Asynchronous server monitoring system (Phase 1: config, state engine, persistence)"
+description = "Asynchronous server monitoring system (Phases 1-4: collectors, database, diagnostic agent, multi-burn-rate alerting)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
